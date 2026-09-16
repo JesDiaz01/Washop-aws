@@ -1,0 +1,19 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "washops"
+region = "us-east-1"
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+resolve_s3 = true
+s3_prefix = "washops"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+# AlarmEmail is intentionally not stored here (keeps personal data out of git).
+# First deploy:  sam deploy --parameter-overrides AlarmEmail=you@example.com
+# Later deploys reuse the stack's previous parameter values automatically.
+parameter_overrides = "LogRetentionDays=\"14\""
+image_repositories = []

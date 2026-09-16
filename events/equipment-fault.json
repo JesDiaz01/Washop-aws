@@ -1,0 +1,12 @@
+{
+  "eventId": "evt-1002",
+  "locationId": "miami-01",
+  "eventType": "EQUIPMENT_FAULT",
+  "timestamp": "2026-09-14T18:35:00Z",
+  "data": {
+    "equipmentId": "dryer-2",
+    "faultCode": "E-MOTOR-OVERTEMP",
+    "severity": "HIGH",
+    "message": "Blower motor temperature exceeded threshold"
+  }
+}

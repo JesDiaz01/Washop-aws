@@ -1,0 +1,11 @@
+{
+  "eventId": "evt-bad-1",
+  "locationId": "Miami 01",
+  "eventType": "WASH_COMPLETED",
+  "timestamp": "yesterday",
+  "data": {
+    "washPackage": "Premium",
+    "amount": -22.005,
+    "durationSeconds": 312
+  }
+}

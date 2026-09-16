@@ -1,0 +1,38 @@
+{
+  "name": "washops",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serverless car wash event integration service on AWS (API Gateway, Lambda, SQS, S3, DynamoDB)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "esbuild src/handlers/ingest.ts src/handlers/processor.ts src/handlers/query.ts --bundle --platform=node --target=node22 --minify --sourcemap --outdir=dist",
+    "sam:build": "sam build",
+    "sam:validate": "sam validate --lint",
+    "verify": "npm run typecheck && npm run lint && npm test && npm run build"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1132.0",
+    "@aws-sdk/client-s3": "^3.1132.0",
+    "@aws-sdk/client-sqs": "^3.1132.0",
+    "@aws-sdk/lib-dynamodb": "^3.1132.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/aws-lambda": "^8.10.163",
+    "@types/node": "^22.20.2",
+    "aws-sdk-client-mock": "^4.1.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.10.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^5.0.0"
+  }
+}

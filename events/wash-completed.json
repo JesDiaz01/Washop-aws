@@ -1,0 +1,11 @@
+{
+  "eventId": "evt-1001",
+  "locationId": "miami-01",
+  "eventType": "WASH_COMPLETED",
+  "timestamp": "2026-09-14T18:30:00Z",
+  "data": {
+    "washPackage": "Premium",
+    "amount": 22.0,
+    "durationSeconds": 312
+  }
+}

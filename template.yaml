@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  WashOps - serverless car wash event integration service.
+  API Gateway -> Lambda (ingest) -> S3 archive + SQS -> Lambda (processor) -> DynamoDB,
+  with a DLQ, CloudWatch alarms, and least-privilege IAM roles.
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for CloudWatch alarm notifications (leave blank to skip; confirm the SNS email if set)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+    Description: How long CloudWatch keeps Lambda and API logs
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64] # Graviton: ~20% cheaper per GB-second than x86
+    MemorySize: 256
+    Timeout: 10
+    Environment:
+      Variables:
+        LOG_LEVEL: info
+        NODE_OPTIONS: --enable-source-maps # readable TypeScript stack traces in CloudWatch
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # API Gateway (HTTP API): managed HTTPS entry point
+  # ---------------------------------------------------------------------------
+  WashOpsApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: WashOps event ingestion and query API
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50 # protects the account (and your bill) from a misbehaving client
+        ThrottlingRateLimit: 25
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","responseLatencyMs":"$context.responseLatency","integrationStatus":"$context.integrationStatus","integrationError":"$context.integrationErrorMessage"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/${AWS::StackName}/http-api-access
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # S3: raw event archive (audit trail + replay source)
+  # ---------------------------------------------------------------------------
+  RawEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawEventsAfter30Days # demo setting; production would transition to Glacier instead
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 30
+
+  RawEventsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawEventsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonTlsRequests # a Deny for everyone; it grants nothing
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RawEventsBucket.Arn
+              - !Sub ${RawEventsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------------------
+  # SQS: buffer between ingestion and processing, plus dead-letter queue
+  # ---------------------------------------------------------------------------
+  EventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days (max) to investigate and redrive
+      SqsManagedSseEnabled: true
+
+  EventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60 # >= 6x processor timeout, so in-flight messages aren't redelivered mid-processing
+      MessageRetentionPeriod: 345600 # 4 days: events survive a multi-day processing outage
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventsDeadLetterQueue.Arn
+        maxReceiveCount: 3 # after 3 failed attempts the message moves to the DLQ
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB: processed events + per-location summaries
+  # ---------------------------------------------------------------------------
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST # no capacity planning; pay per read/write
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: locationId
+          AttributeType: S
+        - AttributeName: activityAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: LocationActivityIndex # "latest events for a location"; heartbeats omit activityAt (sparse)
+          KeySchema:
+            - AttributeName: locationId
+              KeyType: HASH
+            - AttributeName: activityAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  LocationSummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: locationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: locationId
+          KeyType: HASH
+
+  # ---------------------------------------------------------------------------
+  # Lambda: ingest (POST /events)
+  # ---------------------------------------------------------------------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/ingest.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ingest
+      Description: Validates events, archives raw payloads to S3, and enqueues them to SQS
+      CodeUri: ./
+      Handler: ingest.handler
+      Role: !GetAtt IngestFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref IngestLogGroup
+      Environment:
+        Variables:
+          RAW_EVENTS_BUCKET: !Ref RawEventsBucket
+          EVENTS_QUEUE_URL: !Ref EventsQueue
+      Events:
+        PostEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WashOpsApi
+            Method: POST
+            Path: /events
+
+  IngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-ingest
+      RetentionInDays: !Ref LogRetentionDays
+
+  IngestFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps ingest Lambda - write own logs, put raw events in S3, send to the events queue
+      AssumeRolePolicyDocument: # trust policy: only the Lambda service may assume this role
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ingest-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt IngestLogGroup.Arn
+              - Sid: ArchiveRawEvents
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${RawEventsBucket.Arn}/raw/*
+              - Sid: EnqueueEvents
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EventsQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda: processor (SQS consumer)
+  # ---------------------------------------------------------------------------
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/processor.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-processor
+      Description: Consumes events from SQS and records them idempotently in DynamoDB
+      CodeUri: ./
+      Handler: processor.handler
+      Role: !GetAtt ProcessorFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProcessorLogGroup
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          SUMMARY_TABLE: !Ref LocationSummaryTable
+      Events:
+        EventsQueueTrigger:
+          Type: SQS # creates an event source mapping: the Lambda service polls the queue for us
+          Properties:
+            Queue: !GetAtt EventsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures] # retry only failed messages, not the whole batch
+            ScalingConfig:
+              MaximumConcurrency: 5 # cap parallel consumers: backpressure for downstream systems
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-processor
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps processor Lambda - write own logs, consume the events queue, write the two tables
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: processor-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ProcessorLogGroup.Arn
+              - Sid: ConsumeEventsQueue # used by the event source mapping when it polls on our behalf
+                Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt EventsQueue.Arn
+              - Sid: WriteEventsAndSummaries # TransactWriteItems is authorized per underlying Put/Update
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource:
+                  - !GetAtt EventsTable.Arn
+                  - !GetAtt LocationSummaryTable.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda: query API (GET routes)
+  # ---------------------------------------------------------------------------
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/query.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-query
+      Description: Serves location summaries and processed events from DynamoDB
+      CodeUri: ./
+      Handler: query.handler
+      Role: !GetAtt QueryFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref QueryLogGroup
+      Environment:
+        Variables:
+          EVENTS_TABLE: !Ref EventsTable
+          SUMMARY_TABLE: !Ref LocationSummaryTable
+      Events:
+        GetLocationSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WashOpsApi
+            Method: GET
+            Path: /locations/{locationId}/summary
+        ListLocationEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WashOpsApi
+            Method: GET
+            Path: /locations/{locationId}/events
+        GetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WashOpsApi
+            Method: GET
+            Path: /events/{eventId}
+
+  QueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-query
+      RetentionInDays: !Ref LogRetentionDays
+
+  QueryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps query Lambda - write own logs, read-only access to the two tables
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: query-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt QueryLogGroup.Arn
+              - Sid: ReadItems
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource:
+                  - !GetAtt EventsTable.Arn
+                  - !GetAtt LocationSummaryTable.Arn
+              - Sid: QueryLocationActivityIndex
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource: !Sub ${EventsTable.Arn}/index/LocationActivityIndex
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch alarms -> SNS
+  # ---------------------------------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: WashOps alarms
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-dlq-not-empty
+      AlarmDescription: Events failed processing repeatedly and were moved to the DLQ. Inspect DLQ messages and processor logs.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventsDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-processing-stalled
+      AlarmDescription: The oldest message in the events queue is over 5 minutes old - processing is stalled or falling behind.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventsQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the WashOps HTTP API
+    Value: !Sub https://${WashOpsApi}.execute-api.${AWS::Region}.amazonaws.com
+  RawEventsBucketName:
+    Value: !Ref RawEventsBucket
+  EventsQueueUrl:
+    Value: !Ref EventsQueue
+  DeadLetterQueueUrl:
+    Value: !Ref EventsDeadLetterQueue
+  EventsTableName:
+    Value: !Ref EventsTable
+  LocationSummaryTableName:
+    Value: !Ref LocationSummaryTable
+  IngestLogGroupName:
+    Value: !Ref IngestLogGroup
+  ProcessorLogGroupName:
+    Value: !Ref ProcessorLogGroup
+  QueryLogGroupName:
+    Value: !Ref QueryLogGroup
+  ApiAccessLogGroupName:
+    Value: !Ref ApiAccessLogGroup
