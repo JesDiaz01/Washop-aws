@@ -1,5 +1,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { EventBridgeClient } from '@aws-sdk/client-eventbridge';
 import { S3Client } from '@aws-sdk/client-s3';
+import { SNSClient } from '@aws-sdk/client-sns';
 import { SQSClient } from '@aws-sdk/client-sqs';
 import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 
@@ -16,11 +18,17 @@ const sdkConfig = { maxAttempts: 3 };
 
 let s3: S3Client | undefined;
 let sqs: SQSClient | undefined;
+let sns: SNSClient | undefined;
+let eventBridge: EventBridgeClient | undefined;
 let dynamo: DynamoDBDocumentClient | undefined;
 
 export const getS3Client = () => (s3 ??= new S3Client(sdkConfig));
 
 export const getSqsClient = () => (sqs ??= new SQSClient(sdkConfig));
+
+export const getSnsClient = () => (sns ??= new SNSClient(sdkConfig));
+
+export const getEventBridgeClient = () => (eventBridge ??= new EventBridgeClient(sdkConfig));
 
 /** DocumentClient converts plain JS objects to DynamoDB's typed attribute format. */
 export const getDynamoClient = () =>

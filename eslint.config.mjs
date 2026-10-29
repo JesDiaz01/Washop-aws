@@ -1,4 +1,5 @@
 import js from '@eslint/js';
+import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
@@ -15,5 +16,9 @@ export default tseslint.config(
   {
     files: ['tests/**/*.ts'],
     rules: { '@typescript-eslint/no-non-null-assertion': 'off' },
+  },
+  {
+    files: ['dashboard/**/*.js'], // plain browser JavaScript, served as-is
+    languageOptions: { globals: globals.browser },
   },
 );

@@ -87,6 +87,29 @@ describe('processor handler (SQS consumer)', () => {
     expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(1);
   });
 
+  it('stores an event from a wrong clock flagged, and sorts it by receipt time', async () => {
+    // receivedAt in the fixture envelope is 2026-09-14T18:30:01Z; this claims to be 3 hours later.
+    await handler(sqsEvent([messageFor(washCompletedPayload({ timestamp: '2026-09-14T21:30:01Z' }))]), lambdaContext);
+
+    const [put] = ddbMock.commandCalls(TransactWriteCommand)[0]!.args[0].input.TransactItems!;
+    expect(put!.Put!.Item).toMatchObject({
+      occurredAt: '2026-09-14T21:30:01.000Z', // the controller's claim is kept as evidence
+      activityAt: '2026-09-14T18:30:01.000Z', // but "recent activity" uses server time
+      clockSkewSeconds: 10_800,
+    });
+  });
+
+  it('records heartbeat liveness in server time, plus how far the controller clock is off', async () => {
+    // A controller whose clock is an hour behind: its heartbeat must not make the site look offline.
+    await handler(sqsEvent([messageFor(heartbeatPayload({ timestamp: '2026-09-14T17:30:01Z' }))]), lambdaContext);
+
+    const update = ddbMock.commandCalls(UpdateCommand)[0]!.args[0].input;
+    expect(update.ExpressionAttributeValues).toMatchObject({
+      ':ts': '2026-09-14T18:30:01.000Z',
+      ':skew': -3_600,
+    });
+  });
+
   it('ignores a stale heartbeat that arrives after a newer one', async () => {
     ddbMock
       .on(UpdateCommand)

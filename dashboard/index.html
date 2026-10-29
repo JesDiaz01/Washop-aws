@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WashOps Operations</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">WashOps <span class="brand-sub">Operations</span></div>
+      <div class="session" id="session" hidden>
+        <span class="muted" id="user-email"></span>
+        <button class="button button-quiet" id="sign-out" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <div class="banner" id="error" role="alert" hidden></div>
+
+      <section class="panel welcome" id="signed-out" hidden>
+        <h1>Sign in to see your sites</h1>
+        <p class="muted">Wash volume, revenue, equipment faults, and connectivity for every location, refreshed every 30 seconds.</p>
+        <button class="button" id="sign-in" type="button">Sign in</button>
+      </section>
+
+      <section id="signed-in" hidden>
+        <div class="toolbar">
+          <h1>All sites</h1>
+          <div class="toolbar-end">
+            <span class="muted" id="updated" aria-live="polite"></span>
+            <button class="button button-quiet" id="refresh" type="button">Refresh</button>
+          </div>
+        </div>
+
+        <div class="kpis" id="kpis"></div>
+
+        <div class="panel">
+          <div class="table-scroll">
+            <table class="data-table">
+              <caption class="visually-hidden">Every site with its totals and connectivity</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Site</th>
+                  <th scope="col">Connectivity</th>
+                  <th scope="col" class="num">Completed washes</th>
+                  <th scope="col" class="num">Wash revenue</th>
+                  <th scope="col" class="num">Payments</th>
+                  <th scope="col" class="num">Faults</th>
+                  <th scope="col">Last heartbeat</th>
+                </tr>
+              </thead>
+              <tbody id="site-rows"></tbody>
+            </table>
+          </div>
+          <p class="empty muted" id="no-sites" hidden>
+            No site has reported yet. Send some events with <code>scripts/send-sample-events.mjs</code>.
+          </p>
+        </div>
+
+        <section class="panel" id="activity" hidden>
+          <div class="toolbar">
+            <h2 id="activity-title">Recent activity</h2>
+            <button class="button button-quiet" id="close-activity" type="button">Close</button>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <caption class="visually-hidden">The site's most recent events, newest first</caption>
+              <thead>
+                <tr>
+                  <th scope="col">When</th>
+                  <th scope="col">Event</th>
+                  <th scope="col">Details</th>
+                </tr>
+              </thead>
+              <tbody id="activity-rows"></tbody>
+            </table>
+          </div>
+          <p class="empty muted" id="no-activity" hidden>No washes, payments, or faults recorded for this site yet.</p>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

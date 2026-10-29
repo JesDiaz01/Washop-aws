@@ -1,8 +1,15 @@
-import type { APIGatewayProxyEventV2, Context, SQSEvent, SQSRecord } from 'aws-lambda';
+import type { APIGatewayProxyEventV2WithJWTAuthorizer, Context, SQSEvent, SQSRecord } from 'aws-lambda';
 
 export const lambdaContext = { awsRequestId: 'test-invocation-id' } as Context;
 
-export function httpEvent(overrides: Partial<APIGatewayProxyEventV2> = {}): APIGatewayProxyEventV2 {
+export const TEST_CLIENT_ID = 'test-site-client';
+
+/** The demo site credential: may send events for miami-01 only. */
+export const TEST_SCOPES = ['washops/events.write', 'washops/events.read', 'washops/site.miami-01'];
+
+export function httpEvent(
+  overrides: Partial<APIGatewayProxyEventV2WithJWTAuthorizer> = {},
+): APIGatewayProxyEventV2WithJWTAuthorizer {
   return {
     version: '2.0',
     routeKey: 'POST /events',
@@ -13,9 +20,18 @@ export function httpEvent(overrides: Partial<APIGatewayProxyEventV2> = {}): APIG
     requestContext: {
       requestId: 'api-request-id',
       http: { method: 'POST', path: '/events', protocol: 'HTTP/1.1', sourceIp: '203.0.113.10', userAgent: 'vitest' },
+      // What API Gateway's JWT authorizer passes along after verifying a client-credentials token.
+      authorizer: {
+        principalId: '',
+        integrationLatency: 0,
+        jwt: {
+          claims: { client_id: TEST_CLIENT_ID, token_use: 'access', scope: TEST_SCOPES.join(' ') },
+          scopes: TEST_SCOPES,
+        },
+      },
     },
     ...overrides,
-  } as APIGatewayProxyEventV2;
+  } as APIGatewayProxyEventV2WithJWTAuthorizer;
 }
 
 export function sqsEvent(bodies: { messageId: string; body: string }[]): SQSEvent {

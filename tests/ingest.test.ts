@@ -4,7 +4,7 @@ import { mockClient } from 'aws-sdk-client-mock';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { handler } from '../src/handlers/ingest';
 import { washCompletedPayload } from './fixtures';
-import { httpEvent, lambdaContext } from './helpers';
+import { httpEvent, lambdaContext, TEST_CLIENT_ID } from './helpers';
 
 const s3Mock = mockClient(S3Client);
 const sqsMock = mockClient(SQSClient);
@@ -39,6 +39,40 @@ describe('ingest handler (POST /events)', () => {
     const message = JSON.parse(sqsMock.commandCalls(SendMessageCommand)[0]!.args[0].input.MessageBody!);
     expect(message.archiveKey).toBe(putInput.Key);
     expect(message.event).toMatchObject({ eventId: 'evt-1001', eventType: 'WASH_COMPLETED' });
+  });
+
+  it('records which authenticated client sent the event in the audit archive', async () => {
+    await post(washCompletedPayload());
+
+    const archived = JSON.parse(s3Mock.commandCalls(PutObjectCommand)[0]!.args[0].input.Body as string);
+    expect(archived.clientId).toBe(TEST_CLIENT_ID);
+  });
+
+  it("returns 403 and stores nothing when the credential isn't bound to the event's site", async () => {
+    const response = await post(washCompletedPayload({ locationId: 'tampa-02' }));
+
+    expect(response.statusCode).toBe(403);
+    expect(JSON.parse(response.body!).message).toContain('tampa-02');
+    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(0);
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(0);
+  });
+
+  it('accepts an event from a controller with a wrong clock but warns about it', async () => {
+    const twoHoursAhead = new Date(Date.now() + 2 * 3_600_000).toISOString();
+
+    const response = await post(washCompletedPayload({ timestamp: twoHoursAhead }));
+
+    expect(response.statusCode).toBe(202);
+    expect(JSON.parse(response.body!).warnings).toEqual([
+      "timestamp is 2 h ahead of server time; check the controller's clock",
+    ]);
+    expect(sqsMock.commandCalls(SendMessageCommand)).toHaveLength(1);
+  });
+
+  it('adds no warnings when the clock is fine', async () => {
+    const response = await post(washCompletedPayload({ timestamp: new Date().toISOString() }));
+
+    expect(JSON.parse(response.body!)).not.toHaveProperty('warnings');
   });
 
   it('propagates a caller-supplied correlation ID end to end', async () => {

@@ -1,16 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
+import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
 import { archiveRawEvent } from '../aws/archive';
 import { enqueueEvent } from '../aws/queue';
+import { clockSkewSeconds, describeSkew, isClockSuspect } from '../domain/clock';
 import { toValidationIssues, washEventSchema } from '../domain/events';
-import { BadRequestError, HttpError } from '../shared/errors';
-import { jsonResponse, parseJsonBody } from '../shared/http';
+import { canSendFor } from '../domain/siteAccess';
+import { BadRequestError, ForbiddenError, HttpError } from '../shared/errors';
+import { callerClientId, callerScopes, jsonResponse, parseJsonBody } from '../shared/http';
 import { createLogger, serializeError } from '../shared/logger';
 
 /**
  * POST /events
  *
- * validate -> archive raw payload to S3 -> enqueue to SQS -> 202 Accepted.
+ * validate -> check the credential may send for this site -> archive raw payload to S3 -> enqueue
+ * to SQS -> 202 Accepted.
  * Deliberately does NOT touch DynamoDB: the API stays fast and available even if processing is slow or broken.
  */
 
@@ -19,20 +22,22 @@ const logger = createLogger({ service: 'washops-ingest' });
 const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._-]{8,128}$/;
 
 /** Reuse the caller's correlation ID if it sent a sane one; otherwise start a new trace. */
-function resolveCorrelationId(headers: APIGatewayProxyEventV2['headers']): string {
+function resolveCorrelationId(headers: APIGatewayProxyEventV2WithJWTAuthorizer['headers']): string {
   const incoming = headers['x-correlation-id']; // HTTP API lower-cases header names
   return incoming && CORRELATION_ID_PATTERN.test(incoming) ? incoming : randomUUID();
 }
 
 export const handler = async (
-  event: APIGatewayProxyEventV2,
+  event: APIGatewayProxyEventV2WithJWTAuthorizer,
   context: Context,
 ): Promise<APIGatewayProxyStructuredResultV2> => {
   const startedAt = Date.now();
   const correlationId = resolveCorrelationId(event.headers ?? {});
+  const clientId = callerClientId(event);
   const responseHeaders = { 'x-correlation-id': correlationId };
   const log = logger.child({
     correlationId,
+    clientId, // which site credential sent this
     awsRequestId: context.awsRequestId, // Lambda invocation ID
     apiRequestId: event.requestContext.requestId, // matches the API Gateway access log
   });
@@ -52,7 +57,20 @@ export const handler = async (
     });
     eventLog.info('Event received');
 
+    // Checked before anything is stored: a mismatched event never reaches the archive or the queue.
+    if (!canSendFor(callerScopes(event), washEvent.locationId)) {
+      throw new ForbiddenError(`This credential may not send events for location ${washEvent.locationId}`);
+    }
+
     const receivedAt = new Date().toISOString();
+
+    // A wrong controller clock is flagged, not rejected: the wash still happened.
+    const warnings: string[] = [];
+    if (isClockSuspect(washEvent, receivedAt)) {
+      const skew = clockSkewSeconds(washEvent.timestamp, receivedAt);
+      warnings.push(`timestamp is ${describeSkew(skew)} server time; check the controller's clock`);
+      eventLog.warn('Controller clock looks wrong; event accepted and flagged', { clockSkewSeconds: skew });
+    }
 
     // 1) Durable raw audit record first...
     const archiveKey = await archiveRawEvent({
@@ -61,6 +79,7 @@ export const handler = async (
       correlationId,
       receivedAt,
       apiRequestId: event.requestContext.requestId,
+      clientId,
       sourceIp: event.requestContext.http.sourceIp,
       userAgent: event.requestContext.http.userAgent,
       payload,
@@ -73,7 +92,12 @@ export const handler = async (
 
     return jsonResponse(
       202,
-      { message: 'Event accepted', eventId: washEvent.eventId, correlationId },
+      {
+        message: 'Event accepted',
+        eventId: washEvent.eventId,
+        correlationId,
+        ...(warnings.length > 0 ? { warnings } : {}),
+      },
       responseHeaders,
     );
   } catch (error) {

@@ -5,13 +5,15 @@ on:
     branches: [main]
   pull_request:
 
-# The workflow only needs to read the repo. No AWS credentials are used by CI.
+# Read-only by default. Only the jobs that talk to AWS may request an OIDC token.
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are cancelled. Runs on main queue instead, so one pipeline at a time
+  # deploys dev, tests it, and promotes to prod.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -36,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: verify
     env:
-      AWS_DEFAULT_REGION: us-east-1 # required by the SAM CLI; nothing is deployed
+      AWS_DEFAULT_REGION: us-east-1 # required by the SAM CLI; nothing is deployed here
       SAM_CLI_TELEMETRY: 0
     steps:
       - uses: actions/checkout@v5
@@ -54,3 +56,116 @@ jobs:
       - run: npm run sam:validate
       # Via npm so node_modules/.bin (esbuild) is on PATH; SAM's builder does not find dev dependencies otherwise.
       - run: npm run sam:build
+
+      # Build once; dev and prod deploy these exact bundles.
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: sam-build
+          path: .aws-sam/build
+          include-hidden-files: true
+          retention-days: 7
+
+  # The jobs below run only for pushes to main, and only once the one-time setup
+  # (deploy/github-deploy-role.yaml) is done and its outputs are saved as repository variables.
+
+  deploy-dev:
+    name: Deploy to dev
+    runs-on: ubuntu-latest
+    needs: [verify, sam]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != ''
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token; AWS STS exchanges it for temporary credentials
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+      SAM_CLI_TELEMETRY: 0
+    steps:
+      - uses: actions/checkout@v5 # for samconfig.toml
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sam-build
+          path: .aws-sam/build
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: washops-deploy-dev-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - run: >-
+          sam deploy
+          --config-env ci-dev
+          --s3-bucket "${{ vars.SAM_ARTIFACTS_BUCKET }}"
+          --role-arn "${{ vars.CFN_EXECUTION_ROLE_ARN }}"
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset
+
+  integration-tests:
+    name: Integration tests against dev
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    permissions:
+      contents: read
+      id-token: write # reads the dev stack's outputs and test credential
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+      WASHOPS_STACK: washops-dev
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: washops-integration-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - run: npm ci
+      - run: npm run test:integration
+
+  deploy-prod:
+    name: Deploy to prod
+    runs-on: ubuntu-latest
+    needs: integration-tests # prod only gets what passed against dev
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+      SAM_CLI_TELEMETRY: 0
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sam-build
+          path: .aws-sam/build
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: washops-deploy-prod-${{ github.run_id }}
+          aws-region: us-east-1
+
+      # Canary: CodeDeploy shifts traffic over 5 minutes and rolls back on alarms; the job waits for it.
+      - run: >-
+          sam deploy
+          --config-env ci-prod
+          --s3-bucket "${{ vars.SAM_ARTIFACTS_BUCKET }}"
+          --role-arn "${{ vars.CFN_EXECUTION_ROLE_ARN }}"
+          --no-confirm-changeset
+          --no-fail-on-empty-changeset

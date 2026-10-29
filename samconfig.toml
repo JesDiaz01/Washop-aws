@@ -1,7 +1,16 @@
 version = 0.1
 
+# Two environments from one template. Every resource name includes the stack name, so both stacks
+# can live side by side in one account (or in separate accounts; see README "Environments").
+#
+#   sam deploy                     -> dev  (washops-dev): all-at-once deploys, data deleted on teardown
+#   sam deploy --config-env prod   -> prod (washops):     canary deploys, data retained, changeset review
+#
+# The template's defaults are the production-safe values; dev overrides them. Local deploys go to
+# dev unless you ask for prod; normally prod is deployed by CI after the integration tests pass.
+
 [default.global.parameters]
-stack_name = "washops"
+stack_name = "washops-dev"
 region = "us-east-1"
 
 [default.validate.parameters]
@@ -9,11 +18,52 @@ lint = true
 
 [default.deploy.parameters]
 resolve_s3 = true
+s3_prefix = "washops-dev"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\""
+tags = "Project=\"washops\" Environment=\"dev\""
+image_repositories = []
+
+[prod.global.parameters]
+stack_name = "washops"
+region = "us-east-1"
+
+[prod.deploy.parameters]
+resolve_s3 = true
 s3_prefix = "washops"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM"
 # AlarmEmail is intentionally not stored here (keeps personal data out of git).
-# First deploy:  sam deploy --parameter-overrides AlarmEmail=you@example.com
+# First deploy:  sam deploy --config-env prod --parameter-overrides AlarmEmail=you@example.com
 # Later deploys reuse the stack's previous parameter values automatically.
 parameter_overrides = "LogRetentionDays=\"14\""
+tags = "Project=\"washops\" Environment=\"prod\""
 image_repositories = []
+
+# Used by the GitHub Actions pipeline (`sam deploy --config-env ci-dev`, then `ci-prod`). The
+# artifacts bucket and the CloudFormation execution role come from deploy/github-deploy-role.yaml
+# and are passed on the command line.
+[ci-dev.global.parameters]
+stack_name = "washops-dev"
+region = "us-east-1"
+
+[ci-dev.deploy.parameters]
+s3_prefix = "washops-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\""
+tags = "Project=\"washops\" Environment=\"dev\""
+
+[ci-prod.global.parameters]
+stack_name = "washops"
+region = "us-east-1"
+
+[ci-prod.deploy.parameters]
+s3_prefix = "washops"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "LogRetentionDays=\"14\""
+tags = "Project=\"washops\" Environment=\"prod\""

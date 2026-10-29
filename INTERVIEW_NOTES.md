@@ -2,13 +2,20 @@
 
 How to explain this project out loud, honestly and confidently.
 
-**Framing to keep:** *"I'm a full-stack TypeScript developer; AWS was my weakest area, so I built and deployed this to get real hands-on experience."* Everything below is something I actually built, deployed, and verified, unless it's marked **(future / conceptual)**.
+**Framing to keep:** *"I'm a full-stack TypeScript developer; AWS was my weakest area, so I built and deployed this to get real hands-on experience."* Everything below is something I actually built, deployed, and verified, unless it's marked:
+
+- **(built, not yet deployed)**: written and unit-tested, but not yet run in AWS. Say exactly that. After deploying and checking it, delete the marker.
+- **(future / conceptual)**: not built.
 
 ---
 
 ## 30-Second Project Explanation
 
 > "WashOps is a small serverless integration service I built on AWS to get hands-on cloud experience. It simulates car wash controllers sending operational events (washes, payments, equipment faults, heartbeats) to an API. API Gateway invokes a Lambda that validates the event, archives the raw payload to S3, puts it on an SQS queue, and returns 202 right away. A second Lambda consumes the queue and writes to DynamoDB idempotently, so duplicate deliveries never double-count revenue. Failed messages retry and land in a dead-letter queue with a CloudWatch alarm. Everything is TypeScript, defined in a SAM template with least-privilege IAM roles, and I deployed it and tested the failure paths in a real AWS account."
+
+**If they ask what I added next (built, not yet deployed):**
+
+> "Then I closed the gaps I'd listed. The API now requires Cognito tokens: client credentials for each site's controller, and a hosted sign-in with PKCE for a small operations dashboard on CloudFront. A scheduled Lambda notices when a site stops sending heartbeats and emails once when it goes offline and once when it's back. Processed events flow from the DynamoDB stream onto an EventBridge bus, so other systems can subscribe; high-severity faults email maintenance. Deploys go through GitHub Actions with OIDC, no stored keys: build once, deploy to a dev stack, run integration tests against the real services, then promote the same build to prod, where CodeDeploy canaries roll back automatically on alarms. Each site's credential is bound to its own location by a scope in the token, and events from controllers with wrong clocks are accepted but flagged. There's also a replay tool and Athena over the S3 archive."
 
 ## 2-Minute Architecture Walkthrough
 
@@ -23,6 +30,7 @@ Follow one event through the system:
 7. **Failures.** If a message fails, the processor reports just that message ID. SQS makes it visible again after the 60-second visibility timeout. After 3 failed receives it moves to the dead-letter queue and a CloudWatch alarm emails me.
 8. **Read side.** A query Lambda behind `GET` routes serves the location summary (a single-item read of pre-computed counters), an event by ID, and recent events via a GSI.
 9. **Around it all:** CloudWatch structured logs and alarms, a separate least-privilege IAM role per function, all defined in `template.yaml`, deployed with `sam deploy`, and CI in GitHub Actions.
+10. **(Built, not yet deployed.)** Before step 1, API Gateway's JWT authorizer checks a Cognito token and the route's scope, so bad requests never reach a Lambda. After step 6, the DynamoDB stream feeds a publisher Lambda that puts the event on an EventBridge bus; a rule emails HIGH/CRITICAL faults. Separately, every 5 minutes a scheduled Lambda flags sites with no recent heartbeat.
 
 **Numbers I measured:** cold start init was about 430–510 ms; warm processing took about 60–150 ms from API receipt to DynamoDB write; the poison message reached the DLQ after 3 attempts over about 3.5 minutes, and the alarm fired about 2.5 minutes after that.
 
@@ -70,6 +78,20 @@ Follow one event through the system:
 - **Why I used it:** the whole environment is reviewable, repeatable, and deletable as one stack.
 - **Most important lesson:** CloudFormation reads `!Ref`/`!GetAtt` to build a dependency graph (the DLQ was created before the queue that points to it), and changesets show a plan before anything changes.
 
+### Added in the second round (built, not yet deployed)
+
+Say "I built and unit-tested this; I haven't deployed it yet" until it's verified in AWS.
+
+- **Amazon Cognito:** a user pool that issues JWTs. Controllers use the OAuth **client credentials** flow (one app client per site); dashboard users sign in on the hosted page with **authorization code + PKCE**. Scopes `washops/events.write` and `washops/events.read` decide which routes a token can call; a per-site scope (`washops/site.miami-01`) decides which location a controller may send for.
+- **Two environments:** the same template deploys as `washops-dev` and `washops` (prod), with samconfig profiles. A parameter picks `DeletionPolicy`, which needs the `AWS::LanguageExtensions` transform.
+- **DynamoDB Streams:** an ordered log of item changes. The publisher Lambda reads only new, non-heartbeat items thanks to an event source mapping filter.
+- **Amazon EventBridge:** a custom bus plus rules (pattern → target). One rule emails HIGH/CRITICAL faults; an archive keeps 30 days for replay. **EventBridge Scheduler** runs the site monitor every 5 minutes.
+- **AWS CodeDeploy:** `AutoPublishAlias` + `DeploymentPreference` gives each deploy a new Lambda version behind a `live` alias; CodeDeploy shifts 10% of traffic for 5 minutes and rolls back if the error alarms fire.
+- **AWS X-Ray:** active tracing on every function.
+- **Amazon Athena + AWS Glue:** a table over the S3 archive with partition projection, a workgroup with a 1 GB scan cap, and saved queries.
+- **Amazon CloudFront:** serves the dashboard from a private bucket (Origin Access Control) with security headers (CSP, HSTS).
+- **GitHub OIDC → IAM:** the deploy job assumes a role with a short-lived token; no AWS keys are stored in GitHub.
+
 ---
 
 ## Why SQS?
@@ -92,9 +114,9 @@ What the queue buys:
 - **Retries:** when a consumer fails, the message isn't deleted, so it becomes visible again after the **visibility timeout** and is retried.
 - **Poison message:** a message that will *never* succeed (malformed JSON, schema mismatch, a bug triggered by specific data). Without a limit it retries until it expires, wasting compute and hiding real problems.
 - **DLQ behavior:** the source queue's **redrive policy** says "after `maxReceiveCount` receives, move the message to this other queue." The message keeps its body and ID. Nothing consumes the DLQ automatically: it's a quarantine for humans.
-- **In my project:** `maxReceiveCount: 3`, visibility timeout 60 s, and a CloudWatch alarm when the DLQ has any messages. I sent a garbage message directly to SQS, watched 3 failed attempts in the logs, saw it move to the DLQ, and got the alarm.
+- **In my project:** visibility timeout 60 s and a CloudWatch alarm when the DLQ has any messages. With `maxReceiveCount: 3`, I sent a garbage message directly to SQS, watched 3 failed attempts in the logs, saw it move to the DLQ, and got the alarm.
 - **After fixing the bug:** **redrive** moves messages back to the source queue (`aws sqs start-message-move-task`). For truly invalid messages, you log them and delete them instead.
-- **Tuning:** AWS recommends `maxReceiveCount` of at least 5 for Lambda consumers so brief throttling doesn't DLQ healthy messages. I used 3 so the demo would finish in minutes.
+- **Tuning:** AWS recommends `maxReceiveCount` of at least 5 for Lambda consumers so brief throttling doesn't DLQ healthy messages. I used 3 so the demo would finish in minutes, then raised it to 5 **(built, not yet deployed)**.
 
 ## What Is Lambda?
 
@@ -130,14 +152,16 @@ With **API Gateway** I declare routes, and AWS operates the endpoint:
 - **Identity-based vs resource-based policies:** attached to the principal ("this role can write to that bucket") vs attached to the resource ("this Lambda can be invoked by this API", "this bucket denies non-TLS").
 - **Role:** an identity with no permanent credentials. A **trust policy** says who may assume it (my roles trust only `lambda.amazonaws.com`); assuming it through STS returns temporary credentials.
 - **Least privilege:** grant only the actions and resources a component needs. My ingest role can only `PutObject` under `raw/*` in one bucket and `SendMessage` to one queue. If its code were compromised, it couldn't read the archive or touch DynamoDB.
-- **Humans:** I didn't use the root user for work. I created an admin IAM user and used `aws login`, which gives the CLI short-lived credentials from a browser sign-in, so no access keys sit on disk. In CI, GitHub OIDC would assume a deploy role with temporary credentials **(documented, not implemented)**.
+- **Humans:** I didn't use the root user for work. I created an admin IAM user and used `aws login`, which gives the CLI short-lived credentials from a browser sign-in, so no access keys sit on disk.
+- **CI (built, not yet deployed):** GitHub Actions gets a signed OIDC token per run; STS exchanges it for a deploy role whose trust policy accepts only `repo:JesDiaz01/Washop-aws:ref:refs/heads/main`. That role can only upload artifacts, run change sets on the `washops-dev` and `washops` stacks, and read the dev test credential, passing CloudFormation a separate execution role that actually creates resources. Two roles so the CI identity itself can't create anything directly. The execution role has an explicit Deny on the setup stack's own roles: otherwise an app template could attach admin rights to the very roles that deploy it.
 
 ## What Is CloudWatch?
 
 - **Logs:** everything a Lambda writes to stdout goes to a **log group** (one per function), split into **log streams** (one per execution environment). I set 14-day retention so logs don't accumulate cost forever.
 - **Logs Insights:** a query language over logs. Because my logs are JSON, I can `filter correlationId = '…'` or `stats count(*) by outcome`.
 - **Metrics:** numeric time series published automatically by services: Lambda `Errors`/`Duration`/`Throttles`, SQS `ApproximateNumberOfMessagesVisible`/`ApproximateAgeOfOldestMessage`, DynamoDB throttles.
-- **Alarms:** watch a metric against a threshold and notify through SNS. Mine: DLQ not empty; oldest message older than 5 minutes.
+- **Alarms:** watch a metric against a threshold and notify through SNS. Mine: DLQ not empty; oldest message older than 5 minutes. **(Built, not yet deployed:)** any error-level log line, Lambda crashes and throttles summed across functions with metric math, API 5xx, and publisher failures.
+- **Metrics from logs (built, not yet deployed):** Embedded Metric Format turns fields on a log line into custom metrics (`EventsProcessed`, `DuplicateEvents`, `OfflineSites`) with no API calls; a metric filter turns every `level = "error"` line into `ErrorLogs`. That catches failures the code *handles*, like a 500 to a controller, which Lambda's own `Errors` metric never sees.
 
 **How I investigate a production problem:** start from the symptom's **metric** (what and when), use the **alarm** timeline to find when it started, check **what changed** (deploy history), then go to **Logs Insights** filtered to that time window and a specific correlationId or eventId to find the actual error.
 
@@ -169,8 +193,8 @@ With **API Gateway** I declare routes, and AWS operates the endpoint:
 - **Properties:** extremely durable (designed for 11 nines), strongly consistent reads after writes, cheap per GB, with lifecycle rules to transition or expire data.
 - **Why raw events go there:**
   - **Audit:** proof of exactly what the controller sent, before validation stripped or normalized anything.
-  - **Replay:** after fixing a processing bug, events can be re-run from the archive **(replay tool is future work)**.
-  - **Analytics:** Hive-style keys (`date=…/location=…`) let Athena query the archive directly **(future)**.
+  - **Replay:** events that were accepted but never processed can be requeued from the archive with the replay Lambda; idempotency makes over-selecting safe **(built, not yet deployed)**.
+  - **Analytics:** Hive-style keys (`date=…/location=…`) let Athena query the archive directly, with partition projection so no crawler is needed **(built, not yet deployed)**.
 - **In my project:** every receipt is its own object (eventId + correlationId), so retries don't overwrite the original.
 
 ## What Is SAM?
@@ -180,7 +204,7 @@ With **API Gateway** I declare routes, and AWS operates the endpoint:
 - **SAM** is two things:
   1. **A template transform:** shorthand such as `AWS::Serverless::Function` with an `Events` section that expands into the Lambda function, permissions, API routes, and event source mappings. The final template is plain CloudFormation.
   2. **A CLI:** `sam build` (bundled my TypeScript with esbuild), `sam deploy` (uploaded artifacts, created and executed the changeset), `sam validate --lint`, `sam logs`, `sam delete`.
-- **My template:** about 30 resources: 1 HTTP API, 3 functions, 3 IAM roles, 2 queues, 1 bucket plus policy, 2 tables, 4 log groups, 2 alarms, an SNS topic and subscription.
+- **My template:** the deployed version had about 30 resources: 1 HTTP API, 3 functions, 3 IAM roles, 2 queues, 1 bucket plus policy, 2 tables, 4 log groups, 2 alarms, an SNS topic and subscription. The second round **(built, not yet deployed)** expands to 96 after the SAM transform: 6 functions, each with a version, a `live` alias, and a CodeDeploy deployment group, plus Cognito, EventBridge, CloudFront, and Athena.
 - **Real lesson:** SAM's esbuild builder couldn't find esbuild as a devDependency, and its `--build-in-source` option did a production-only install that deleted my devDependencies. I fixed it by running `sam build` through an npm script so `node_modules/.bin` is on PATH.
 
 ## Idempotency
@@ -216,6 +240,7 @@ You can't prevent duplicates across network boundaries. You make processing **sa
 - Call `GET /locations/{id}/summary` and look at `lastUpdated`.
 - Pick an event a site just sent and call `GET /events/{eventId}`: is it there or 404?
 - Check **what changed**: recent deploys (CloudFormation stack events), IAM or config changes.
+- **(Built, not yet deployed.)** Check the location's `connectivity`. If it's `OFFLINE`, the site itself stopped sending (network or controller), and there should already be a site alert email. Also check for `401`s and `403`s in the API access logs: an expired or rotated site credential, or a controller configured with the wrong site ID, looks exactly like "the dashboard stopped updating". And check `controllerClockSkewSeconds`: a controller whose clock jumped years back sends events that look "missing" from recent activity even though they're stored.
 
 **1. API Gateway: is it really accepting events?**
 - Access logs or metrics: are responses `202`, or `4xx`/`5xx`?
@@ -258,16 +283,16 @@ You can't prevent duplicates across network boundaries. You make processing **sa
 
 ## Production Improvements
 
-What I'd add for a real high-volume system **(all future / conceptual)**:
+What I'd add for a real high-volume system. Items marked **(built, not yet deployed)** were on this list and are now written and unit-tested; the rest are **future / conceptual**:
 
-1. **Authenticate devices:** per-site identity via IAM SigV4 (e.g. IAM Roles Anywhere with device certificates), mTLS on a custom domain, or OAuth client credentials with a JWT authorizer; WAF in front.
-2. **Environments and safe deploys:** separate dev/staging/prod accounts; GitHub OIDC deploys; integration tests against staging; Lambda aliases with CodeDeploy canary rollouts that auto-rollback on alarms.
-3. **Observability:** X-Ray/OpenTelemetry tracing; business metrics (washes/min per site); dashboards; alarms on API 5xx, Lambda errors/throttles, and DynamoDB throttles; on-call runbooks for DLQ redrive.
-4. **Reliability tuning:** `maxReceiveCount` ≥ 5; reserved concurrency; load tests to set throttles and concurrency.
-5. **Data protection:** DynamoDB PITR and `DeletionPolicy: Retain`; S3 versioning, Glacier lifecycle, Object Lock for audit retention; customer-managed KMS keys if required.
+1. **Authenticate devices:** OAuth client credentials with a JWT authorizer, one Cognito app client per site, each bound to its `locationId` by a scope **(built, not yet deployed)**. Still future: past ~98 sites a mapping table or IoT Core certificates instead of scopes; WAF in front.
+2. **Environments and safe deploys:** dev and prod stacks, GitHub OIDC pipeline (build once → dev → integration tests → prod), and Lambda aliases with CodeDeploy canary rollouts that auto-rollback on alarms **(built, not yet deployed)**. Still future: separate AWS accounts per environment and a manual approval gate for prod.
+3. **Observability:** X-Ray active tracing, business metrics via EMF, a CloudWatch dashboard, alarms on API 5xx, Lambda errors/throttles, and error logs, plus a written runbook **(built, not yet deployed)**. Still future: SDK-level tracing (Powertools/OpenTelemetry) and DynamoDB throttle alarms.
+4. **Reliability tuning:** `maxReceiveCount` 5 **(built, not yet deployed)**. Still future: reserved concurrency; load tests to set throttles and concurrency.
+5. **Data protection:** DynamoDB PITR, `DeletionPolicy: Retain`, and S3 versioning **(built, not yet deployed)**. Still future: Glacier lifecycle, Object Lock for audit retention, customer-managed KMS keys if required.
 6. **Scale and cost:** at millions of events per month, individual S3 PUTs become a notable cost, so batch the archive through Kinesis Data Firehose; consider Kinesis Data Streams for high-rate telemetry; FIFO queues grouped by location if strict ordering becomes a requirement.
-7. **Replay and analytics:** a replay tool from the S3 archive; Athena/Glue tables over the partitioned keys.
-8. **Integration:** EventBridge to fan processed events out to other systems (maintenance ticketing, loyalty, BI); relational integration with location master data (Aurora PostgreSQL via RDS Proxy, or DynamoDB Streams → reporting database).
+7. **Replay and analytics:** a replay tool from the S3 archive and Athena/Glue tables over the partitioned keys **(built, not yet deployed)**.
+8. **Integration:** EventBridge fan-out of processed events, fed from the DynamoDB stream **(built, not yet deployed)**. Still future: relational integration with location master data (Aurora PostgreSQL via RDS Proxy).
 9. **Contracts:** versioned event schemas, contract tests with firmware teams, pagination on list endpoints.
 
 ---
@@ -293,13 +318,13 @@ The message becomes visible again after the visibility timeout and is redelivere
 No: standard SQS is best-effort ordering. Counters are commutative, so order doesn't matter for them. For `lastHeartbeat` I use a conditional update so an older heartbeat can't overwrite a newer one. If strict per-location ordering were a business requirement, I'd use a FIFO queue with `MessageGroupId = locationId`, accepting lower throughput limits.
 
 **7. How did you choose the visibility timeout and maxReceiveCount?**
-AWS recommends a visibility timeout of at least 6× the Lambda timeout: my function timeout is 10 s, so 60 s. That prevents a message from being redelivered while still being processed. I set `maxReceiveCount` to 3 so the DLQ demo finished in minutes; for production I'd use at least 5 so short throttling episodes don't push healthy messages to the DLQ.
+AWS recommends a visibility timeout of at least 6× the Lambda timeout: my function timeout is 10 s, so 60 s. That prevents a message from being redelivered while still being processed. I set `maxReceiveCount` to 3 so the DLQ demo finished in minutes, then raised it to 5 **(built, not yet deployed)** so short throttling episodes don't push healthy messages to the DLQ.
 
 **8. What is ReportBatchItemFailures and why use it?**
 Lambda receives up to 10 messages per invocation. Without partial batch responses, one bad message makes the whole batch fail and all 10 get retried, reprocessing successful ones. With it, my handler returns only failed message IDs, so the others are deleted. Idempotency makes reprocessing safe anyway, but this avoids wasted work and noise.
 
 **9. A bug put 500 messages in the DLQ. How do you recover?**
-Find the root cause from DLQ message bodies plus processor logs by messageId. Deploy the fix. Then redrive: `aws sqs start-message-move-task` moves them back to the main queue. Replaying is safe because processing is idempotent. Messages that are genuinely invalid get logged and deleted. The DLQ retention (14 days) gives time for this.
+Find the root cause from DLQ message bodies plus processor logs by messageId. Deploy the fix. Then redrive: `aws sqs start-message-move-task` moves them back to the main queue. Replaying is safe because processing is idempotent. Messages that are genuinely invalid get logged and deleted. The DLQ retention (14 days) gives time for this. If messages were lost anyway (purged, or past retention), the replay Lambda requeues a day of events from the S3 archive **(built, not yet deployed)**; duplicates are skipped, so over-selecting is harmless.
 
 **10. Why DynamoDB instead of PostgreSQL?**
 The access patterns are simple and key-based: record an event, get by ID, get a location summary, list recent events for a location. DynamoDB handles those with predictable latency, no connection management across many concurrent Lambdas, and pay-per-request pricing. I'm comfortable with PostgreSQL; I'd use it for relational data like locations, owners, and cross-site reporting, where ad-hoc SQL matters.
@@ -308,7 +333,7 @@ The access patterns are simple and key-based: record an event, get by ID, get a 
 `EventsTable` has partition key `eventId` for direct lookups and dedupe. `LocationSummaryTable` has partition key `locationId`, with counters pre-aggregated on write so reads are one GetItem. A GSI on `EventsTable` with `locationId` as partition key and `activityAt` as sort key serves "latest events for a location" newest first. Heartbeats omit `activityAt`, which makes it a sparse index. TTL expires old event items.
 
 **12. How is the API secured?**
-Honestly, the demo API isn't authenticated. SAM flagged it and I accepted it explicitly. What I did implement: throttling, input validation with size limits, least-privilege roles, encryption, a TLS-only bucket policy, and no leaked error details. For production I'd authenticate each controller, for example SigV4 with per-device credentials via IAM Roles Anywhere, or mTLS, plus WAF.
+The deployed version wasn't authenticated; SAM flagged it and I accepted it for the demo. I've since built authentication **(built, not yet deployed)**: Cognito issues JWTs, and API Gateway's JWT authorizer checks signature, expiry, issuer, client, and scope before any Lambda runs, so a bad request gets a 401 and costs nothing. Each site's controller has its own app client and uses the client credentials flow; posting needs `events.write`, reading needs `events.read`. The dashboard uses the hosted sign-in with PKCE and only gets `events.read`. Ingest logs and archives the caller's `client_id`, so every event is attributable. Each site credential is also bound to its own location: its token carries `washops/site.<locationId>`, and ingest returns 403 for an event from any other site, before storing anything. Around that: throttling, input validation with size limits, least-privilege roles, encryption, TLS-only bucket policies, and no leaked error details. Next I'd put WAF in front.
 
 **13. How do the Lambdas get AWS credentials?**
 Each function has an IAM execution role that trusts `lambda.amazonaws.com`. Lambda assumes the role through STS and provides temporary credentials to the runtime; the AWS SDK picks them up automatically and they rotate. Nothing is hardcoded, and there are no keys in environment variables or code.
@@ -323,10 +348,10 @@ When Lambda has no warm execution environment, it must create one (load code, st
 The serverless pieces scale horizontally: API Gateway and SQS handle high throughput, and Lambda scales out within concurrency quotas, which I'd review and raise. Likely pressure points: Lambda concurrency limits, DynamoDB hot partitions (a very busy location), per-request S3 PUT cost (batch through Firehose), and the throttling limits I set. I'd load-test, add alarms, and tune batch size and max concurrency.
 
 **17. How do you deploy safely and roll back?**
-Today: `sam deploy` creates a CloudFormation changeset I review, and a failed deployment rolls back automatically. CI runs typecheck, lint, tests, `sam validate --lint`, and `sam build` on every PR. For production: separate accounts per environment, OIDC-based deploys from GitHub Actions, and Lambda aliases with CodeDeploy canary traffic shifting that rolls back on CloudWatch alarms.
+What I've run: `sam deploy` creates a CloudFormation changeset I review, and a failed deployment rolls back automatically. CI runs typecheck, lint, tests, `sam validate --lint`, and `sam build` on every PR. **(Built, not yet deployed:)** pushes to `main` deploy from GitHub Actions through OIDC, with no stored keys. Every function publishes a new version behind a `live` alias, and CodeDeploy sends it 10% of traffic for 5 minutes; if the Lambda-errors or error-logs alarm fires, the alias snaps back to the old version. The tradeoff is slower deploys, so the dev stack uses `AllAtOnce`. The pipeline builds once, deploys that build to `washops-dev`, runs integration tests against the real services, and only then deploys the same build to prod, so prod runs exactly the code that passed. Still future: separate accounts per environment and a manual approval step before prod.
 
 **18. How do you test without calling AWS?**
-Unit tests run the real handlers with the AWS SDK mocked via `aws-sdk-client-mock`. I can assert the exact commands sent (e.g. the transaction's condition expression and counter values) and simulate AWS failures: S3 errors, DynamoDB throttling, transaction cancellation. Then I verified end to end against the deployed stack. Automated integration tests against a staging stack would be the next step.
+Unit tests run the real handlers with the AWS SDK mocked via `aws-sdk-client-mock`. I can assert the exact commands sent (e.g. the transaction's condition expression and counter values) and simulate AWS failures: S3 errors, DynamoDB throttling, transaction cancellation. Then I verified end to end against the deployed stack by hand. **(Built, not yet run against AWS:)** an integration suite now does that automatically: it reads the dev stack's outputs and test credential, gets a real token, and checks 401/400/403, the full pipeline, duplicate counting, clock flagging, and the read path, polling because processing is asynchronous. I ran it against a local mock of the API first, which caught a bug in the test itself: passing `undefined` to a function with a default parameter quietly used the default, so the "no token" test was sending a token.
 
 **19. Why HTTP API instead of REST API?**
 HTTP API is cheaper, lower latency, and simpler, and it has everything I needed: Lambda proxy routes, throttling, and access logs. I'd pick REST API if I needed usage plans and API keys per customer, request validation at the gateway, response caching, private endpoints, or direct WAF integration.
@@ -335,10 +360,28 @@ HTTP API is cheaper, lower latency, and simpler, and it has everything I needed:
 **(Conceptual.)** Location master data, owners, and pricing would live in PostgreSQL/Aurora as the source of truth. Two common patterns: enrich on the read path (query Lambda joins summaries with location metadata), or stream processed events from DynamoDB Streams into PostgreSQL for reporting. Lambda would connect through RDS Proxy to avoid exhausting connections, with credentials in Secrets Manager.
 
 **21. What would you alert on?**
-DLQ not empty and the queue's oldest message age (both implemented), plus API 5xx rate, Lambda errors and throttles, DynamoDB throttling, and a business signal like "no heartbeat from a site in 10 minutes", which would catch a site going offline even when every AWS service is healthy.
+DLQ not empty and the queue's oldest message age (both deployed). **(Built, not yet deployed:)** API 5xx, Lambda errors and throttles, any error-level log line, publisher failures, and the business signal: a site with no heartbeat for 10 minutes, which catches a site going offline even when every AWS service is healthy. Still future: DynamoDB throttling.
 
-**22. A controller has a wrong clock and sends timestamps from 2019. What happens?**
-Validation accepts any valid ISO timestamp, so it's processed, and it sorts far back in "recent events". `receivedAt` (server time) is stored alongside `occurredAt`, so it's detectable. I'd add a clock-skew check that flags or rejects events too far from `receivedAt`, and alert on it per controller.
+**22. How does the offline detection avoid spamming or missing alerts? (Built, not yet deployed.)**
+It alerts on transitions only: ONLINE → OFFLINE and back. Before emailing, the monitor claims the change with a conditional update: "set OFFLINE only if `lastHeartbeat` is still the value I read and the site isn't already OFFLINE." Only one run can win that write, so overlapping or retried runs alert once, and a heartbeat that arrives mid-check makes the condition fail instead of producing a false alarm. If the email fails, it undoes the claim and fails the run so Scheduler retries.
+
+**23. Why publish to EventBridge from the DynamoDB stream instead of from the processor? (Built, not yet deployed.)**
+Publishing right after the transaction is a dual write. If the transaction commits and the publish fails, the SQS retry hits the idempotency check, gets DUPLICATE, and the event is never published. The stream only has a record when an item was actually inserted, so publishing from it means "published if and only if recorded", and duplicates never produce a second stream record. EventBridge is still at-least-once, so subscribers dedupe on `eventId`.
+
+**24. How does the dashboard sign people in without a secret in the browser? (Built, not yet deployed.)**
+Authorization code flow with PKCE. The page makes a random verifier, sends its SHA-256 hash to Cognito's hosted sign-in, and after the redirect exchanges the code plus the original verifier for tokens. Someone who intercepts the code can't use it without the verifier. Tokens stay in sessionStorage, the access token only has `events.read`, every value is rendered with `textContent`, and a CSP only allows scripts from the site and calls to the API and Cognito.
+
+**25. How does GitHub deploy to AWS without access keys? (Built, not yet deployed.)**
+GitHub Actions requests an OIDC token for the run; AWS STS trusts GitHub's identity provider and exchanges the token for temporary credentials of a deploy role. The trust policy only accepts tokens whose `sub` is this repository's `main` branch. That role can only upload artifacts and run change sets on the `washops` stack, passing CloudFormation a separate execution role; so a leaked workflow can't call, say, `iam:CreateUser` directly.
+
+**26. A controller has a wrong clock and sends timestamps from 2019. What happens?**
+**(Built, not yet deployed.)** It's accepted, because the wash and the money are real, but flagged. Ingest compares the timestamp with server time: more than 5 minutes in the future, or older than 7 days (too old to be a backlog after an outage), gets a warning in the 202 and a `clockSkewSeconds` on the stored event, which then sorts by receipt time so it doesn't vanish from recent activity. Heartbeats measure the clock error directly, since they're never buffered: the site summary keeps `controllerClockSkewSeconds`, the dashboard shows "Clock 3 h behind", and an alarm fires. I also changed liveness to use server receipt time: before, a controller with a slow clock would have looked offline, and one with a fast clock would have stayed "online" after it went silent.
+
+**27. How do you stop one site's credential from sending another site's events? (Built, not yet deployed.)**
+Each site's Cognito app client is granted a scope naming its location, like `washops/site.miami-01`. API Gateway has already verified the token, so ingest just checks that the event's `locationId` is in the token's scopes, and returns 403 before archiving or queueing anything. No lookup on the request path. The limit is Cognito's 100 custom scopes per resource server, so around 98 sites; past that I'd move to a mapping table behind a Lambda authorizer, or IoT Core with a certificate per device.
+
+**28. How are dev and prod separated? (Built, not yet deployed.)**
+Same template, two stacks: every resource name includes the stack name, so they coexist with their own user pools, credentials, tables, and alarms. samconfig profiles set the differences: dev deploys all at once and deletes its data on teardown; prod uses canaries and retains data. The template's defaults are the prod values, so a forgotten parameter fails safe. In a real company I'd put them in separate AWS accounts; the pipeline supports that by giving each deploy job its own role.
 
 ---
 
@@ -363,3 +406,15 @@ After this project I should be able to explain:
 - [ ] SAM vs CloudFormation, changesets, rollback, stack dependency ordering
 - [ ] CI with GitHub Actions, and deploying with OIDC instead of stored keys
 - [ ] How to troubleshoot "API works but data is stale" by bisecting at the queue
+- [ ] OAuth 2.0 client credentials vs. authorization code + PKCE; JWT authorizers and scopes
+- [ ] DynamoDB Streams, event source mapping filters, and why publishing from a stream avoids a dual write
+- [ ] EventBridge buses, rules, input transformers, archives; EventBridge Scheduler
+- [ ] Claim-then-act with conditional writes (offline alerts)
+- [ ] Lambda versions and aliases; CodeDeploy canaries with alarm rollback
+- [ ] Embedded Metric Format, metric filters, metric math alarms, X-Ray traces
+- [ ] Athena partition projection and scan-cost control
+- [ ] Claims-based authorization: binding a credential to a site with a scope
+- [ ] Flag vs. reject for bad data; server time vs. device time
+- [ ] Environments as stacks vs. accounts; samconfig profiles; LanguageExtensions for parameterized DeletionPolicy
+- [ ] Build once, promote; integration tests as a deploy gate
+- [ ] CloudFront with Origin Access Control, CORS, and a Content Security Policy

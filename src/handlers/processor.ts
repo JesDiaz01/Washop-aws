@@ -1,8 +1,10 @@
 import type { Context, SQSBatchItemFailure, SQSBatchResponse, SQSEvent, SQSRecord } from 'aws-lambda';
-import { recordEvent } from '../aws/eventStore';
+import { recordEvent, type RecordOutcome } from '../aws/eventStore';
+import { clockSkewSeconds, isClockSuspect } from '../domain/clock';
 import { type QueueEnvelope, queueEnvelopeSchema, toValidationIssues } from '../domain/events';
 import { InvalidMessageError } from '../shared/errors';
 import { createLogger, serializeError } from '../shared/logger';
+import { metricFields } from '../shared/metrics';
 
 /**
  * SQS consumer. Lambda polls the queue and invokes this with a batch of messages.
@@ -29,7 +31,12 @@ export function parseQueueMessage(body: string): QueueEnvelope {
   return parsed.data;
 }
 
-async function processRecord(record: SQSRecord, context: Context): Promise<void> {
+interface RecordResult {
+  outcome: RecordOutcome;
+  clockSuspect: boolean;
+}
+
+async function processRecord(record: SQSRecord, context: Context): Promise<RecordResult> {
   const log = logger.child({
     awsRequestId: context.awsRequestId,
     messageId: record.messageId,
@@ -59,9 +66,17 @@ async function processRecord(record: SQSRecord, context: Context): Promise<void>
     const outcome = await recordEvent(envelope);
     if (outcome === 'DUPLICATE') {
       eventLog.warn('Duplicate event skipped (already processed)', { outcome });
-    } else {
-      eventLog.info('Event processed', { outcome });
+      return { outcome, clockSuspect: false };
     }
+
+    eventLog.info('Event processed', { outcome });
+    const clockSuspect = isClockSuspect(event, envelope.receivedAt);
+    if (clockSuspect) {
+      eventLog.warn('Controller clock looks wrong', {
+        clockSkewSeconds: clockSkewSeconds(event.timestamp, envelope.receivedAt),
+      });
+    }
+    return { outcome, clockSuspect };
   } catch (error) {
     eventLog.error('Failed to record event; message will be retried', { error: serializeError(error) });
     throw error;
@@ -70,11 +85,20 @@ async function processRecord(record: SQSRecord, context: Context): Promise<void>
 
 export const handler = async (event: SQSEvent, context: Context): Promise<SQSBatchResponse> => {
   const batchItemFailures: SQSBatchItemFailure[] = [];
+  let processed = 0;
+  let duplicates = 0;
+  let clockSkewed = 0;
 
   // Sequential keeps logs readable and load on DynamoDB predictable; batches are at most 10 messages.
   for (const record of event.Records) {
     try {
-      await processRecord(record, context);
+      const { outcome, clockSuspect } = await processRecord(record, context);
+      if (outcome === 'DUPLICATE') {
+        duplicates += 1;
+      } else {
+        processed += 1;
+      }
+      if (clockSuspect) clockSkewed += 1;
     } catch {
       batchItemFailures.push({ itemIdentifier: record.messageId });
     }
@@ -84,6 +108,7 @@ export const handler = async (event: SQSEvent, context: Context): Promise<SQSBat
     awsRequestId: context.awsRequestId,
     received: event.Records.length,
     failed: batchItemFailures.length,
+    ...metricFields({ EventsProcessed: processed, DuplicateEvents: duplicates, ClockSkewedEvents: clockSkewed }),
   });
 
   return { batchItemFailures };

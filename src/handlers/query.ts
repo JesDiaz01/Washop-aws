@@ -1,13 +1,21 @@
-import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
-import { type EventItem, getEvent, getLocationSummary, listRecentEvents, type LocationSummaryItem } from '../aws/eventStore';
+import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
+import {
+  getEvent,
+  getLocationSummary,
+  listLocationSummaries,
+  listRecentEvents,
+  type LocationSummaryItem,
+  toPublicEvent,
+} from '../aws/eventStore';
 import { eventIdSchema, locationIdSchema } from '../domain/events';
 import { BadRequestError, HttpError, NotFoundError } from '../shared/errors';
-import { jsonResponse } from '../shared/http';
+import { callerClientId, jsonResponse } from '../shared/http';
 import { createLogger, serializeError } from '../shared/logger';
 
 /**
  * Read API. One function serves all GET routes; API Gateway passes the matched route in routeKey.
  *
+ *   GET /locations
  *   GET /locations/{locationId}/summary
  *   GET /locations/{locationId}/events?limit=20
  *   GET /events/{eventId}
@@ -18,7 +26,7 @@ const logger = createLogger({ service: 'washops-query' });
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 
-function pathParam(event: APIGatewayProxyEventV2, name: string, schema: typeof eventIdSchema): string {
+function pathParam(event: APIGatewayProxyEventV2WithJWTAuthorizer, name: string, schema: typeof eventIdSchema): string {
   const result = schema.safeParse(event.pathParameters?.[name]);
   if (!result.success) {
     throw new BadRequestError(`Invalid ${name}`);
@@ -47,18 +55,24 @@ export function toSummaryResponse(item: LocationSummaryItem) {
     paymentVolume: centsToDollars(item.paymentVolumeCents),
     equipmentFaults: item.equipmentFaults ?? 0,
     lastHeartbeat: item.lastHeartbeat ?? null,
+    // From the latest heartbeat: how far the controller's clock is off (positive = ahead).
+    controllerClockSkewSeconds: item.controllerClockSkewSeconds ?? null,
+    // As of the site monitor's last check (every 5 minutes). UNKNOWN: no heartbeat ever received.
+    connectivity: item.connectivity ?? (item.lastHeartbeat ? 'ONLINE' : 'UNKNOWN'),
+    connectivityChangedAt: item.connectivityChangedAt ?? null,
     lastUpdated: item.lastUpdated ?? null,
   };
 }
 
-function toEventResponse(item: EventItem) {
-  // Hide storage internals (TTL + index key) from API consumers.
-  const { expiresAt, activityAt, ...publicFields } = item;
-  return publicFields;
-}
-
-async function route(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> {
+async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyStructuredResultV2> {
   switch (event.routeKey) {
+    case 'GET /locations': {
+      const locations = (await listLocationSummaries())
+        .map(toSummaryResponse)
+        .sort((a, b) => a.locationId.localeCompare(b.locationId));
+      return jsonResponse(200, { count: locations.length, locations });
+    }
+
     case 'GET /locations/{locationId}/summary': {
       const locationId = pathParam(event, 'locationId', locationIdSchema);
       const summary = await getLocationSummary(locationId);
@@ -70,7 +84,7 @@ async function route(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStru
       const locationId = pathParam(event, 'locationId', locationIdSchema);
       const limit = parseLimit(event.queryStringParameters?.limit);
       const items = await listRecentEvents(locationId, limit);
-      return jsonResponse(200, { locationId, count: items.length, events: items.map(toEventResponse) });
+      return jsonResponse(200, { locationId, count: items.length, events: items.map(toPublicEvent) });
     }
 
     case 'GET /events/{eventId}': {
@@ -78,7 +92,7 @@ async function route(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStru
       const item = await getEvent(eventId);
       // 404 can also mean "accepted but still in the queue": processing is asynchronous.
       if (!item) throw new NotFoundError(`Event ${eventId} not found (it may not be processed yet)`);
-      return jsonResponse(200, toEventResponse(item));
+      return jsonResponse(200, toPublicEvent(item));
     }
 
     default:
@@ -87,13 +101,14 @@ async function route(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStru
 }
 
 export const handler = async (
-  event: APIGatewayProxyEventV2,
+  event: APIGatewayProxyEventV2WithJWTAuthorizer,
   context: Context,
 ): Promise<APIGatewayProxyStructuredResultV2> => {
   const log = logger.child({
     awsRequestId: context.awsRequestId,
     apiRequestId: event.requestContext.requestId,
     routeKey: event.routeKey,
+    clientId: callerClientId(event),
   });
 
   try {

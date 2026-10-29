@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { describeSkew, isClockSuspect } from '../src/domain/clock';
+import { connectivityChangeFor } from '../src/domain/connectivity';
 import { toValidationIssues, washEventSchema } from '../src/domain/events';
+import { canSendFor } from '../src/domain/siteAccess';
 import { counterIncrementsFor, toCents } from '../src/domain/summary';
 import { heartbeatPayload, washCompletedPayload } from './fixtures';
 
@@ -71,5 +74,60 @@ describe('counterIncrementsFor', () => {
     expect(19.99 * 100).not.toBe(1999); // the bug we're guarding against
     expect(toCents(19.99)).toBe(1999);
     expect(toCents(0.1) + toCents(0.2)).toBe(30);
+  });
+});
+
+describe('connectivityChangeFor', () => {
+  const now = new Date('2026-09-14T12:00:00Z');
+  const site = (lastHeartbeat: string | undefined, connectivity?: 'ONLINE' | 'OFFLINE') => ({
+    locationId: 'miami-01',
+    lastHeartbeat,
+    connectivity,
+  });
+
+  it.each([
+    ['silent past the threshold', site('2026-09-14T11:49:00Z'), 'OFFLINE'],
+    ['silent exactly at the threshold', site('2026-09-14T11:50:00Z'), undefined],
+    ['heartbeating normally', site('2026-09-14T11:59:00Z'), undefined],
+    ['still offline', site('2026-09-14T09:00:00Z', 'OFFLINE'), undefined],
+    ['offline but heartbeating again', site('2026-09-14T11:59:00Z', 'OFFLINE'), 'ONLINE'],
+    ['online again and silent again', site('2026-09-14T11:00:00Z', 'ONLINE'), 'OFFLINE'],
+    ['never sent a heartbeat', site(undefined), undefined],
+  ])('%s', (_label, input, expected) => {
+    expect(connectivityChangeFor(input, now, 10)).toBe(expected);
+  });
+});
+
+describe('isClockSuspect', () => {
+  const receivedAt = '2026-09-14T12:00:00.000Z';
+  const wash = (timestamp: string) => ({ eventType: 'WASH_COMPLETED' as const, timestamp });
+  const heartbeat = (timestamp: string) => ({ eventType: 'CONTROLLER_HEARTBEAT' as const, timestamp });
+
+  it.each([
+    ['a wash a few seconds old', wash('2026-09-14T11:59:50Z'), false],
+    ['a wash from a 2-day backlog after an outage', wash('2026-09-12T12:00:00Z'), false],
+    ['a wash 10 minutes in the future', wash('2026-09-14T12:10:00Z'), true],
+    ['a wash from 2019', wash('2019-01-01T00:00:00Z'), true],
+    ['a heartbeat 2 minutes behind (network delay)', heartbeat('2026-09-14T11:58:00Z'), false],
+    ['a heartbeat an hour behind (clock wrong)', heartbeat('2026-09-14T11:00:00Z'), true],
+    ['a heartbeat 10 minutes ahead', heartbeat('2026-09-14T12:10:00Z'), true],
+  ])('%s', (_label, event, expected) => {
+    expect(isClockSuspect(event, receivedAt)).toBe(expected);
+  });
+
+  it('describes skew in words people can act on', () => {
+    expect(describeSkew(600)).toBe('10 min ahead of');
+    expect(describeSkew(-7_200)).toBe('2 h behind');
+    expect(describeSkew(-3 * 86_400)).toBe('3 days behind');
+  });
+});
+
+describe('canSendFor', () => {
+  const scopes = ['washops/events.write', 'washops/site.miami-01'];
+
+  it('allows only the sites named in the token', () => {
+    expect(canSendFor(scopes, 'miami-01')).toBe(true);
+    expect(canSendFor(scopes, 'tampa-02')).toBe(false);
+    expect(canSendFor(scopes, 'miami-0')).toBe(false); // no prefix tricks
   });
 });

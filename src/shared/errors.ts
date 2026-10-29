@@ -16,6 +16,12 @@ export class BadRequestError extends HttpError {
   }
 }
 
+export class ForbiddenError extends HttpError {
+  constructor(message: string) {
+    super(403, message);
+  }
+}
+
 export class PayloadTooLargeError extends HttpError {
   constructor(maxBytes: number) {
     super(413, `Request body exceeds ${maxBytes} bytes`);

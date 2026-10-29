@@ -1,20 +1,38 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
+# LanguageExtensions runs first so DeletionPolicy can come from a parameter (dev deletes, prod retains).
+Transform: [AWS::LanguageExtensions, AWS::Serverless-2016-10-31]
 Description: >
   WashOps - serverless car wash event integration service.
-  API Gateway -> Lambda (ingest) -> S3 archive + SQS -> Lambda (processor) -> DynamoDB,
-  with a DLQ, CloudWatch alarms, and least-privilege IAM roles.
+  API Gateway (Cognito JWT auth) -> Lambda (ingest) -> S3 archive + SQS -> Lambda (processor) -> DynamoDB
+  -> stream -> EventBridge, with offline-site detection, a DLQ, alarms, canary deploys, Athena over the
+  archive, an operations dashboard, and least-privilege IAM roles.
 
 Parameters:
   AlarmEmail:
     Type: String
     Default: ''
-    Description: Optional email for CloudWatch alarm notifications (leave blank to skip; confirm the SNS email if set)
+    Description: Optional email for alarm and site alert notifications (leave blank to skip; confirm each SNS email if set)
   LogRetentionDays:
     Type: Number
     Default: 14
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
     Description: How long CloudWatch keeps Lambda and API logs
+  OfflineAfterMinutes:
+    Type: Number
+    Default: 10
+    MinValue: 2
+    MaxValue: 1440
+    Description: A site is reported offline after this many minutes without a controller heartbeat
+  DeploymentStrategy:
+    Type: String
+    Default: Canary10Percent5Minutes
+    AllowedValues: [Canary10Percent5Minutes, Linear10PercentEvery1Minute, AllAtOnce]
+    Description: How new Lambda versions take traffic (AllAtOnce for fast iteration in a dev stack)
+  DataRetentionPolicy:
+    Type: String
+    Default: Retain
+    AllowedValues: [Retain, Delete]
+    Description: What happens to the tables and raw archive when the stack is deleted (Delete suits a throwaway dev stack)
 
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
@@ -25,10 +43,21 @@ Globals:
     Architectures: [arm64] # Graviton: ~20% cheaper per GB-second than x86
     MemorySize: 256
     Timeout: 10
+    Tracing: Active # X-Ray: per-invocation timing (init vs. handler), linked across the SQS hop
+    # Every deploy publishes a version behind a "live" alias; API routes, the queue, the stream, and
+    # the schedule all invoke the alias. CodeDeploy shifts traffic to the new version gradually and
+    # rolls back automatically if either alarm fires during the shift.
+    AutoPublishAlias: live
+    DeploymentPreference:
+      Type: !Ref DeploymentStrategy
+      Alarms:
+        - !Ref LambdaErrorsAlarm
+        - !Ref ErrorLogsAlarm
     Environment:
       Variables:
         LOG_LEVEL: info
         NODE_OPTIONS: --enable-source-maps # readable TypeScript stack traces in CloudWatch
+        METRICS_NAMESPACE: !Sub WashOps/${AWS::StackName} # custom metrics emitted as structured logs (EMF)
 
 Resources:
   # ---------------------------------------------------------------------------
@@ -38,6 +67,24 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       Description: WashOps event ingestion and query API
+      Auth:
+        # API Gateway verifies every token (signature, expiry, issuer, audience, scopes) before any
+        # Lambda runs, so unauthenticated traffic never reaches our code or costs an invocation.
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: # Cognito access tokens carry client_id instead of aud; list every app client allowed in
+                - !Ref SiteControllerClient
+                - !Ref DashboardClient
+      CorsConfiguration: # only the dashboard's origin may call the API from a browser
+        AllowOrigins:
+          - !Sub https://${DashboardDistribution.DomainName}
+        AllowMethods: [GET]
+        AllowHeaders: [authorization]
+        MaxAge: 600
       DefaultRouteSettings:
         ThrottlingBurstLimit: 50 # protects the account (and your bill) from a misbehaving client
         ThrottlingRateLimit: 25
@@ -52,11 +99,209 @@ Resources:
       RetentionInDays: !Ref LogRetentionDays
 
   # ---------------------------------------------------------------------------
+  # Cognito: who may call the API
+  #   site controllers (machines): OAuth 2.0 client credentials, one app client per site
+  #   people (dashboard): hosted sign-in page, authorization code flow with PKCE
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true # no self sign-up: an administrator invites people
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub ${AWS::StackName}-${AWS::AccountId} # hosts the OAuth endpoints; must be globally unique
+
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: washops # scopes below become washops/events.write and washops/events.read
+      Name: WashOps API
+      Scopes:
+        - ScopeName: events.write
+          ScopeDescription: Send events (site controllers)
+        - ScopeName: events.read
+          ScopeDescription: Read location summaries and processed events
+        # One scope per site: ingest only accepts an event whose locationId is named in the token.
+        - ScopeName: site.miami-01
+          ScopeDescription: Send events for location miami-01
+
+  # One app client per site, so a single site's credential can be rotated or revoked on its own.
+  # Add a site: add a site.<locationId> scope above, copy this client with that scope, and add the
+  # new client's !Ref to the authorizer's audience list.
+  SiteControllerClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ApiResourceServer # the scopes must exist before a client can be granted them
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-site-miami-01
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthScopes: [washops/events.write, washops/events.read, washops/site.miami-01]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH] # no user sign-in through a machine credential
+      AccessTokenValidity: 60 # controllers cache the token and fetch a new one hourly (billed per token request)
+      TokenValidityUnits:
+        AccessToken: minutes
+
+  # People sign in to the dashboard on Cognito's hosted page (authorization code flow with PKCE).
+  # Read-only: the dashboard can't be granted events.write.
+  DashboardClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ApiResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-dashboard
+      GenerateSecret: false # a browser can't keep a secret; PKCE protects the code exchange instead
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, washops/events.read]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub 'https://${DashboardDistribution.DomainName}/']
+      LogoutURLs: [!Sub 'https://${DashboardDistribution.DomainName}/']
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60 # the dashboard asks people to sign in again after an hour
+      IdTokenValidity: 60
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---------------------------------------------------------------------------
+  # Dashboard website: private S3 bucket behind CloudFront
+  # ---------------------------------------------------------------------------
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration: # the bucket stays private; only CloudFront can read it
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyThisDistribution # Origin Access Control: CloudFront signs its requests to S3
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${DashboardBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DashboardBucket.Arn
+              - !Sub ${DashboardBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  DashboardOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-dashboard
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${AWS::StackName}-dashboard-headers
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            # Scripts only from this site; network calls only to the API and Cognito. Wildcard hosts
+            # avoid a dependency cycle (the API's CORS setting already depends on this distribution).
+            ContentSecurityPolicy: !Sub "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com https://*.auth.${AWS::Region}.amazoncognito.com; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            Override: true
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: no-referrer # the sign-in callback URL carries a one-time code
+            Override: true
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: WashOps dashboard
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100 # North America and Europe edge locations only
+        Origins:
+          - Id: dashboard-bucket
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt DashboardOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: '' # empty: Origin Access Control replaces the legacy identity
+        DefaultCacheBehavior:
+          TargetOriginId: dashboard-bucket
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # AWS managed CachingOptimized (honors the Cache-Control we upload with)
+          ResponseHeadersPolicyId: !Ref DashboardResponseHeaders
+
+  # ---------------------------------------------------------------------------
   # S3: raw event archive (audit trail + replay source)
   # ---------------------------------------------------------------------------
   RawEventsBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: !Ref DataRetentionPolicy # prod: the audit trail survives a stack delete or an accidental replacement
+    UpdateReplacePolicy: !Ref DataRetentionPolicy
     Properties:
+      VersioningConfiguration:
+        Status: Enabled # an overwritten or deleted object stays recoverable as a noncurrent version
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -75,6 +320,8 @@ Resources:
             Status: Enabled
             Prefix: raw/
             ExpirationInDays: 30
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7 # how long a deleted or overwritten object can still be recovered
 
   RawEventsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -95,6 +342,159 @@ Resources:
                 aws:SecureTransport: 'false'
 
   # ---------------------------------------------------------------------------
+  # Athena: SQL over the raw archive where it already sits (nothing is copied)
+  # ---------------------------------------------------------------------------
+  ArchiveDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join ['_', !Split ['-', !Sub '${AWS::StackName}_archive']] # Athena-friendly: no hyphens
+        Description: WashOps raw event archive in S3
+
+  ArchiveRawEventsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref ArchiveDatabase
+      TableInput:
+        Name: raw_events
+        Description: One row per accepted request; a controller retry repeats an eventid, so dedupe on it
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          # Partition projection: Athena derives each day's partition from the key layout, so new
+          # days are queryable immediately, with no crawler or MSCK REPAIR TABLE to run.
+          projection.enabled: 'true'
+          projection.received_date.type: date
+          projection.received_date.format: yyyy-MM-dd
+          projection.received_date.range: 2026-01-01,NOW
+          projection.received_date.interval: '1'
+          projection.received_date.interval.unit: DAYS
+          storage.location.template: !Sub s3://${RawEventsBucket}/raw/date=${!received_date}/
+        PartitionKeys:
+          - Name: received_date # filter on it in every query: it limits which objects Athena reads (and bills)
+            Type: string
+        StorageDescriptor:
+          Location: !Sub s3://${RawEventsBucket}/raw/
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe # maps camelCase JSON keys to these lowercase columns
+            Parameters:
+              ignore.malformed.json: 'true'
+          Columns:
+            - { Name: eventid, Type: string }
+            - { Name: locationid, Type: string }
+            - { Name: correlationid, Type: string }
+            - { Name: receivedat, Type: string }
+            - { Name: apirequestid, Type: string }
+            - { Name: clientid, Type: string }
+            - { Name: sourceip, Type: string }
+            - { Name: useragent, Type: string }
+            - Name: payload # the body exactly as the controller sent it
+              Type: >-
+                struct<eventtype:string,timestamp:string,data:struct<washpackage:string,bayid:string,amount:double,durationseconds:int,paymentmethod:string,transactionid:string,equipmentid:string,faultcode:string,severity:string,message:string,controllerid:string,firmwareversion:string,uptimeseconds:bigint>>
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireQueryResults
+            Status: Enabled
+            ExpirationInDays: 7
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub ${AWS::StackName}-archive
+      Description: Queries over the WashOps raw event archive
+      RecursiveDeleteOption: true # deleting the stack also deletes saved queries and history
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        BytesScannedCutoffPerQuery: 1073741824 # 1 GB per query: a missing date filter can't run up a bill
+        PublishCloudWatchMetricsEnabled: false
+        EngineVersion:
+          SelectedEngineVersion: Athena engine version 3
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AthenaResultsBucket}/results/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  DailyRevenueQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: Daily revenue by site
+      Description: Completed washes and wash revenue per site per day, last 7 days
+      Database: !Ref ArchiveDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Completed washes and revenue per site per day, last 7 days.
+        -- The archive keeps every receipt, so a controller retry repeats an event: dedupe on eventid first.
+        WITH washes AS (
+          SELECT eventid,
+                 arbitrary(locationid) AS locationid,
+                 arbitrary(received_date) AS received_date,
+                 arbitrary(payload.data.amount) AS amount
+          FROM raw_events
+          WHERE received_date >= date_format(current_date - interval '7' day, '%Y-%m-%d')
+            AND payload.eventtype = 'WASH_COMPLETED'
+          GROUP BY eventid
+        )
+        SELECT received_date, locationid, count(*) AS completed_washes, sum(amount) AS revenue
+        FROM washes
+        GROUP BY received_date, locationid
+        ORDER BY received_date DESC, locationid;
+
+  FaultsByEquipmentQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: Equipment faults by code
+      Description: Fault counts per site, equipment, and code, last 30 days
+      Database: !Ref ArchiveDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Which equipment fails most often, last 30 days.
+        SELECT locationid,
+               payload.data.equipmentid AS equipment,
+               payload.data.faultcode AS fault_code,
+               payload.data.severity AS severity,
+               count(DISTINCT eventid) AS faults
+        FROM raw_events
+        WHERE received_date >= date_format(current_date - interval '30' day, '%Y-%m-%d')
+          AND payload.eventtype = 'EQUIPMENT_FAULT'
+        GROUP BY 1, 2, 3, 4
+        ORDER BY faults DESC;
+
+  EventReceiptsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: Every receipt of one event
+      Description: Shows controller retries and which credential sent each request (edit the date and eventid)
+      Database: !Ref ArchiveDatabase
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: |
+        -- Every time the API accepted this event. Edit the date and eventid.
+        SELECT receivedat, correlationid, clientid, sourceip, useragent, "$path" AS archive_object
+        FROM raw_events
+        WHERE received_date = '2026-09-14'
+          AND eventid = 'evt-1001'
+        ORDER BY receivedat;
+
+  # ---------------------------------------------------------------------------
   # SQS: buffer between ingestion and processing, plus dead-letter queue
   # ---------------------------------------------------------------------------
   EventsDeadLetterQueue:
@@ -111,15 +511,19 @@ Resources:
       SqsManagedSseEnabled: true
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt EventsDeadLetterQueue.Arn
-        maxReceiveCount: 3 # after 3 failed attempts the message moves to the DLQ
+        maxReceiveCount: 5 # after 5 failed attempts the message moves to the DLQ (AWS guidance for Lambda consumers)
 
   # ---------------------------------------------------------------------------
   # DynamoDB: processed events + per-location summaries
   # ---------------------------------------------------------------------------
   EventsTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: !Ref DataRetentionPolicy # prod: processed data survives a stack delete or an accidental replacement
+    UpdateReplacePolicy: !Ref DataRetentionPolicy
     Properties:
       BillingMode: PAY_PER_REQUEST # no capacity planning; pay per read/write
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true # restore to any second in the last 35 days
       AttributeDefinitions:
         - AttributeName: eventId
           AttributeType: S
@@ -142,11 +546,17 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE # every committed insert feeds the event publisher (no dual write)
 
   LocationSummaryTable:
     Type: AWS::DynamoDB::Table
+    DeletionPolicy: !Ref DataRetentionPolicy
+    UpdateReplacePolicy: !Ref DataRetentionPolicy
     Properties:
       BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       AttributeDefinitions:
         - AttributeName: locationId
           AttributeType: S
@@ -185,6 +595,9 @@ Resources:
             ApiId: !Ref WashOpsApi
             Method: POST
             Path: /events
+            Auth:
+              Authorizer: CognitoJwt
+              AuthorizationScopes: [washops/events.write]
 
   IngestLogGroup:
     Type: AWS::Logs::LogGroup
@@ -203,6 +616,8 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns: # X-Ray has no resource-level permissions, so this is the one Resource "*" grant
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: ingest-least-privilege
           PolicyDocument:
@@ -272,6 +687,8 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns: # X-Ray has no resource-level permissions, so this is the one Resource "*" grant
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: processor-least-privilege
           PolicyDocument:
@@ -317,24 +734,42 @@ Resources:
           EVENTS_TABLE: !Ref EventsTable
           SUMMARY_TABLE: !Ref LocationSummaryTable
       Events:
+        ListLocations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WashOpsApi
+            Method: GET
+            Path: /locations
+            Auth:
+              Authorizer: CognitoJwt
+              AuthorizationScopes: [washops/events.read]
         GetLocationSummary:
           Type: HttpApi
           Properties:
             ApiId: !Ref WashOpsApi
             Method: GET
             Path: /locations/{locationId}/summary
+            Auth:
+              Authorizer: CognitoJwt
+              AuthorizationScopes: [washops/events.read]
         ListLocationEvents:
           Type: HttpApi
           Properties:
             ApiId: !Ref WashOpsApi
             Method: GET
             Path: /locations/{locationId}/events
+            Auth:
+              Authorizer: CognitoJwt
+              AuthorizationScopes: [washops/events.read]
         GetEvent:
           Type: HttpApi
           Properties:
             ApiId: !Ref WashOpsApi
             Method: GET
             Path: /events/{eventId}
+            Auth:
+              Authorizer: CognitoJwt
+              AuthorizationScopes: [washops/events.read]
 
   QueryLogGroup:
     Type: AWS::Logs::LogGroup
@@ -353,6 +788,8 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns: # X-Ray has no resource-level permissions, so this is the one Resource "*" grant
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies:
         - PolicyName: query-least-privilege
           PolicyDocument:
@@ -372,6 +809,322 @@ Resources:
                 Effect: Allow
                 Action: dynamodb:Query
                 Resource: !Sub ${EventsTable.Arn}/index/LocationActivityIndex
+              - Sid: ListLocations # GET /locations; one small item per site
+                Effect: Allow
+                Action: dynamodb:Scan
+                Resource: !GetAtt LocationSummaryTable.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda: site monitor (scheduled offline detection)
+  # ---------------------------------------------------------------------------
+  SiteMonitorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/siteMonitor.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-site-monitor
+      Description: Flags sites whose controller stopped sending heartbeats and alerts by SNS
+      CodeUri: ./
+      Handler: siteMonitor.handler
+      Timeout: 30
+      Role: !GetAtt SiteMonitorFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SiteMonitorLogGroup
+      Environment:
+        Variables:
+          SUMMARY_TABLE: !Ref LocationSummaryTable
+          SITE_ALERTS_TOPIC_ARN: !Ref SiteAlertsTopic
+          OFFLINE_AFTER_MINUTES: !Ref OfflineAfterMinutes
+      Events:
+        EveryFiveMinutes:
+          Type: ScheduleV2 # EventBridge Scheduler; SAM creates a role that can invoke only this function
+          Properties:
+            ScheduleExpression: rate(5 minutes)
+            Description: Check every site's last heartbeat
+            RetryPolicy:
+              MaximumRetryAttempts: 2 # each run is safe to repeat: changes are recorded with conditional writes
+
+  SiteMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-site-monitor
+      RetentionInDays: !Ref LogRetentionDays
+
+  SiteMonitorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps site monitor Lambda - write own logs, read and update site connectivity, publish site alerts
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: site-monitor-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SiteMonitorLogGroup.Arn
+              - Sid: ReadAndRecordConnectivity
+                Effect: Allow
+                Action: [dynamodb:Scan, dynamodb:UpdateItem]
+                Resource: !GetAtt LocationSummaryTable.Arn
+              - Sid: PublishSiteAlerts
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SiteAlertsTopic
+
+  # ---------------------------------------------------------------------------
+  # EventBridge: processed events fan out to other systems
+  #   EventsTable stream -> publisher Lambda -> event bus -> rules -> targets
+  # ---------------------------------------------------------------------------
+  WashEventsBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${AWS::StackName}-events
+
+  WashEventsArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      Description: Lets a new subscriber replay the last 30 days of events
+      SourceArn: !GetAtt WashEventsBus.Arn
+      RetentionDays: 30
+
+  EventPublisherFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/eventPublisher.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-event-publisher
+      Description: Publishes newly processed events from the EventsTable stream to the EventBridge bus
+      CodeUri: ./
+      Handler: eventPublisher.handler
+      Role: !GetAtt EventPublisherFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EventPublisherLogGroup
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref WashEventsBus
+      Events:
+        EventsTableStream:
+          Type: DynamoDB # event source mapping: the Lambda service reads the stream for us
+          Properties:
+            Stream: !GetAtt EventsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10 # one PutEvents call per batch
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            BisectBatchOnFunctionError: true # isolate a bad record instead of retrying the whole batch
+            MaximumRetryAttempts: 5
+            FilterCriteria:
+              Filters: # new items only, and no heartbeats: filtered records never invoke (or bill) the function
+                - Pattern: '{"eventName": ["INSERT"], "dynamodb": {"NewImage": {"eventType": {"S": [{"anything-but": ["CONTROLLER_HEARTBEAT"]}]}}}}'
+            DestinationConfig:
+              OnFailure: # after the retries, the failed batch's location in the stream is sent here
+                Type: SQS
+                Destination: !GetAtt PublisherFailuresQueue.Arn
+
+  EventPublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-event-publisher
+      RetentionInDays: !Ref LogRetentionDays
+
+  EventPublisherFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps event publisher Lambda - write own logs, read the EventsTable stream, put events on the bus
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: event-publisher-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt EventPublisherLogGroup.Arn
+              - Sid: ReadEventsStream # used by the event source mapping when it reads on our behalf
+                Effect: Allow
+                Action: [dynamodb:DescribeStream, dynamodb:GetRecords, dynamodb:GetShardIterator, dynamodb:ListStreams]
+                Resource: !Sub ${EventsTable.Arn}/stream/*
+              - Sid: PublishToBus
+                Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt WashEventsBus.Arn
+              - Sid: RecordFailedBatches
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt PublisherFailuresQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda: replay (operator tool, invoked by hand; see README runbook)
+  # ---------------------------------------------------------------------------
+  ReplayFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints: [src/handlers/replay.ts]
+        Target: node22
+        Minify: true
+        Sourcemap: true
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-replay
+      Description: Requeues archived events from S3, or republishes processed events to EventBridge
+      CodeUri: ./
+      Handler: replay.handler
+      Timeout: 300 # one day of one site's archive per run
+      Role: !GetAtt ReplayFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref ReplayLogGroup
+      Environment:
+        Variables:
+          RAW_EVENTS_BUCKET: !Ref RawEventsBucket
+          EVENTS_QUEUE_URL: !Ref EventsQueue
+          EVENTS_TABLE: !Ref EventsTable
+          EVENT_BUS_NAME: !Ref WashEventsBus
+
+  ReplayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-replay
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReplayFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: WashOps replay Lambda - read the raw archive, requeue events, republish processed events
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: replay-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ReplayLogGroup.Arn
+              - Sid: ListRawArchive
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RawEventsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: raw/*
+              - Sid: ReadRawArchive
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${RawEventsBucket.Arn}/raw/*
+              - Sid: RequeueEvents
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EventsQueue.Arn
+              - Sid: ReadProcessedEvents
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt EventsTable.Arn
+              - Sid: RepublishEvents
+                Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt WashEventsBus.Arn
+
+  PublisherFailuresQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days to investigate; messages point at stream records, which expire after 24 h
+      SqsManagedSseEnabled: true
+
+  # A subscriber: HIGH and CRITICAL faults email the site alerts topic so maintenance can be sent.
+  HighSeverityFaultRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-high-severity-faults # fixed name: the dashboard's metrics are keyed by it
+      Description: Email site alerts for HIGH and CRITICAL equipment faults
+      EventBusName: !Ref WashEventsBus
+      EventPattern:
+        source: [washops]
+        detail-type: [EQUIPMENT_FAULT]
+        detail:
+          data:
+            severity: [HIGH, CRITICAL]
+      Targets:
+        - Id: site-alerts-email
+          Arn: !Ref SiteAlertsTopic
+          InputTransformer:
+            InputPathsMap:
+              location: $.detail.locationId
+              equipment: $.detail.data.equipmentId
+              faultCode: $.detail.data.faultCode
+              severity: $.detail.data.severity
+              occurredAt: $.detail.occurredAt
+              eventId: $.detail.eventId
+            InputTemplate: '"<severity> equipment fault at <location>: <faultCode> on <equipment> at <occurredAt> (event <eventId>). Dispatch maintenance."'
+
+  # ---------------------------------------------------------------------------
+  # SNS: site alerts (business: a site went offline) vs. alarms (engineering)
+  # ---------------------------------------------------------------------------
+  SiteAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: WashOps site alerts
+
+  SiteAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref SiteAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  SiteAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SiteAlertsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowFaultRuleToPublish # only this one rule, not any EventBridge rule in the account
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SiteAlertsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt HighSeverityFaultRule.Arn
 
   # ---------------------------------------------------------------------------
   # CloudWatch alarms -> SNS
@@ -388,6 +1141,287 @@ Resources:
       TopicArn: !Ref AlarmTopic
       Protocol: email
       Endpoint: !Ref AlarmEmail
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-errors
+      AlarmDescription: A function invocation crashed or timed out. Failures the code handles (500s, retried messages) are counted by the error-logs alarm instead.
+      Metrics:
+        - Id: total
+          Label: Errors across all functions
+          Expression: SUM([ingest, processor, query, siteMonitor, eventPublisher, replay])
+          ReturnData: true
+        - Id: ingest
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref IngestFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: processor
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref ProcessorFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: query
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref QueryFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: siteMonitor
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref SiteMonitorFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: eventPublisher
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref EventPublisherFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: replay
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions: [{ Name: FunctionName, Value: !Ref ReplayFunction }]
+            Period: 60
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-lambda-throttles
+      AlarmDescription: Lambda rejected invocations because a concurrency limit was reached (new accounts can start with a low limit).
+      Metrics:
+        - Id: total
+          Label: Throttles across all functions
+          Expression: SUM([ingest, processor, query, siteMonitor, eventPublisher, replay])
+          ReturnData: true
+        - Id: ingest
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref IngestFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: processor
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref ProcessorFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: query
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref QueryFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: siteMonitor
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref SiteMonitorFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: eventPublisher
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref EventPublisherFunction }]
+            Period: 60
+            Stat: Sum
+        - Id: replay
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions: [{ Name: FunctionName, Value: !Ref ReplayFunction }]
+            Period: 60
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ApiServerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-api-5xx
+      AlarmDescription: The API returned 5 or more server errors in 5 minutes. Controllers retry, so a single 5xx is tolerated.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WashOpsApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # Error-level log lines become one ErrorLogs metric across all functions. This catches failures the
+  # code handles and reports (a 500 to the caller, a message left for retry), which Lambda's own
+  # Errors metric never sees.
+  IngestErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref IngestLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  ProcessorErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ProcessorLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  QueryErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref QueryLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  SiteMonitorErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref SiteMonitorLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  EventPublisherErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref EventPublisherLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  ReplayErrorLogsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReplayLogGroup
+      FilterPattern: '{ $.level = "error" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub WashOps/${AWS::StackName}
+          MetricName: ErrorLogs
+          MetricValue: '1'
+          Unit: Count
+
+  PublisherFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-publisher-failures
+      AlarmDescription: Events were recorded but could not be published to EventBridge after retries. Republish them with the replay function (see README runbook).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PublisherFailuresQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ClockSkewAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-controller-clock-skew
+      AlarmDescription: A controller's clock is more than 5 minutes off (or sent an implausibly old event). Events are accepted and flagged; find the site with GET /locations (controllerClockSkewSeconds) or the processor logs ("Controller clock looks wrong").
+      Namespace: !Sub WashOps/${AWS::StackName}
+      MetricName: ClockSkewedEvents
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  ErrorLogsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-error-logs
+      AlarmDescription: A function logged an error. Search the log groups for level = "error" and follow the correlationId.
+      Namespace: !Sub WashOps/${AWS::StackName}
+      MetricName: ErrorLogs
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
 
   DeadLetterQueueAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -427,10 +1461,153 @@ Resources:
       AlarmActions: [!Ref AlarmTopic]
       OKActions: [!Ref AlarmTopic]
 
+  # ---------------------------------------------------------------------------
+  # CloudWatch dashboard: one page for "is WashOps healthy right now?"
+  # ---------------------------------------------------------------------------
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Ref AWS::StackName
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "alarm", "x": 0, "y": 0, "width": 24, "height": 3,
+              "properties": {
+                "title": "Alarms",
+                "alarms": [
+                  "${DeadLetterQueueAlarm.Arn}", "${QueueBacklogAlarm.Arn}", "${ErrorLogsAlarm.Arn}",
+                  "${LambdaErrorsAlarm.Arn}", "${LambdaThrottlesAlarm.Arn}", "${ApiServerErrorsAlarm.Arn}",
+                  "${PublisherFailuresAlarm.Arn}", "${ClockSkewAlarm.Arn}"
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 3, "width": 12, "height": 6,
+              "properties": {
+                "title": "API requests and errors", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiId", "${WashOpsApi}", { "label": "Requests" }],
+                  [".", "4xx", ".", ".", { "label": "4xx (rejected by validation or auth)" }],
+                  [".", "5xx", ".", ".", { "label": "5xx (server errors)" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 3, "width": 12, "height": 6,
+              "properties": {
+                "title": "API latency (ms)", "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiId", "${WashOpsApi}", { "stat": "p50", "label": "p50" }],
+                  [".", ".", ".", ".", { "stat": "p99", "label": "p99" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "Events processed", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["WashOps/${AWS::StackName}", "EventsProcessed", { "label": "Processed" }],
+                  [".", "DuplicateEvents", { "label": "Duplicates skipped" }],
+                  [".", "ClockSkewedEvents", { "label": "Wrong controller clock" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "Queue health", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${EventsQueue.QueueName}", { "label": "Waiting" }],
+                  [".", "ApproximateNumberOfMessagesVisible", ".", "${EventsDeadLetterQueue.QueueName}", { "label": "In DLQ" }],
+                  [".", "ApproximateAgeOfOldestMessage", ".", "${EventsQueue.QueueName}", { "label": "Oldest message age (s)", "yAxis": "right" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "Sites offline", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 300,
+                "metrics": [
+                  ["WashOps/${AWS::StackName}", "OfflineSites", { "label": "Offline sites" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 15, "width": 12, "height": 6,
+              "properties": {
+                "title": "Failures", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["WashOps/${AWS::StackName}", "ErrorLogs", { "label": "Error log lines" }],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IngestFunction}", { "label": "ingest crashes" }],
+                  [".", ".", ".", "${ProcessorFunction}", { "label": "processor crashes" }],
+                  [".", ".", ".", "${QueryFunction}", { "label": "query crashes" }],
+                  [".", ".", ".", "${SiteMonitorFunction}", { "label": "site monitor crashes" }],
+                  [".", ".", ".", "${EventPublisherFunction}", { "label": "event publisher crashes" }],
+                  [".", "Throttles", ".", "${IngestFunction}", { "label": "ingest throttles" }],
+                  [".", ".", ".", "${ProcessorFunction}", { "label": "processor throttles" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 15, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda duration p99 (ms)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "p99", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IngestFunction}", { "label": "ingest" }],
+                  [".", ".", ".", "${ProcessorFunction}", { "label": "processor" }],
+                  [".", ".", ".", "${QueryFunction}", { "label": "query" }],
+                  [".", ".", ".", "${SiteMonitorFunction}", { "label": "site monitor" }],
+                  [".", ".", ".", "${EventPublisherFunction}", { "label": "event publisher" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 21, "width": 12, "height": 6,
+              "properties": {
+                "title": "High-severity fault alerts (EventBridge rule)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/Events", "TriggeredRules", "RuleName", "${AWS::StackName}-high-severity-faults", { "label": "Faults matched" }],
+                  [".", "Invocations", ".", ".", { "label": "Alerts sent" }],
+                  [".", "FailedInvocations", ".", ".", { "label": "Alerts failed" }]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 21, "width": 12, "height": 6,
+              "properties": {
+                "title": "Stream lag (ms behind)", "region": "${AWS::Region}", "view": "timeSeries", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/Lambda", "IteratorAge", "FunctionName", "${EventPublisherFunction}", { "label": "event publisher" }]
+                ]
+              }
+            }
+          ]
+        }
+
 Outputs:
   ApiBaseUrl:
     Description: Base URL of the WashOps HTTP API
     Value: !Sub https://${WashOpsApi}.execute-api.${AWS::Region}.amazonaws.com
+  TokenUrl:
+    Description: OAuth 2.0 token endpoint; site controllers exchange their client ID and secret here for an access token
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+  UserPoolId:
+    Value: !Ref UserPool
+  SiteControllerClientId:
+    Description: Demo site credential (get its secret with aws cognito-idp describe-user-pool-client)
+    Value: !Ref SiteControllerClient
+  AuthDomain:
+    Description: Cognito hosted sign-in and OAuth endpoints
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  DashboardUrl:
+    Description: The operations dashboard (publish it with scripts/publish-dashboard.mjs)
+    Value: !Sub https://${DashboardDistribution.DomainName}/
+  DashboardBucketName:
+    Value: !Ref DashboardBucket
+  DashboardClientId:
+    Value: !Ref DashboardClient
   RawEventsBucketName:
     Value: !Ref RawEventsBucket
   EventsQueueUrl:
@@ -447,5 +1624,29 @@ Outputs:
     Value: !Ref ProcessorLogGroup
   QueryLogGroupName:
     Value: !Ref QueryLogGroup
+  SiteMonitorLogGroupName:
+    Value: !Ref SiteMonitorLogGroup
+  EventPublisherLogGroupName:
+    Value: !Ref EventPublisherLogGroup
+  EventBusName:
+    Description: Subscribe other systems to processed events with rules on this bus
+    Value: !Ref WashEventsBus
+  PublisherFailuresQueueUrl:
+    Value: !Ref PublisherFailuresQueue
+  ReplayFunctionName:
+    Description: Operator tool for requeueing archived events or republishing processed ones (see README runbook)
+    Value: !Ref ReplayFunction
+  AthenaWorkGroupName:
+    Description: Run the saved queries over the raw archive from this Athena workgroup
+    Value: !Ref AthenaWorkGroup
+  ArchiveDatabaseName:
+    Value: !Ref ArchiveDatabase
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucket
   ApiAccessLogGroupName:
     Value: !Ref ApiAccessLogGroup
+  SiteAlertsTopicArn:
+    Value: !Ref SiteAlertsTopic
+  OperationsDashboardUrl:
+    Description: CloudWatch dashboard for the whole service
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/${OperationsDashboard}

@@ -1,4 +1,4 @@
-import { DynamoDBDocumentClient, GetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { mockClient } from 'aws-sdk-client-mock';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { handler } from '../src/handlers/query';
@@ -26,7 +26,27 @@ describe('query handler', () => {
       totalRevenue: 830.5,
       equipmentFaults: 2,
       lastHeartbeat: null,
+      connectivity: 'UNKNOWN',
     });
+  });
+
+  it('lists every location sorted by ID, with connectivity from the site monitor', async () => {
+    ddbMock.on(ScanCommand).resolves({
+      Items: [
+        { locationId: 'tampa-02', lastHeartbeat: '2026-09-14T18:00:00.000Z', connectivity: 'OFFLINE' },
+        { locationId: 'miami-01', lastHeartbeat: '2026-09-14T18:31:00.000Z' },
+      ],
+    });
+
+    const response = await get('GET /locations', {});
+
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body!);
+    expect(body.count).toBe(2);
+    expect(body.locations.map((l: { locationId: string; connectivity: string }) => [l.locationId, l.connectivity])).toEqual([
+      ['miami-01', 'ONLINE'],
+      ['tampa-02', 'OFFLINE'],
+    ]);
   });
 
   it('returns 404 when an event has not been processed (yet)', async () => {
