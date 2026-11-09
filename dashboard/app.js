@@ -323,10 +323,20 @@ function renderActivity(locationId, events) {
   $('activity-rows').replaceChildren(
     ...events.map((event) => {
       const { label, details } = describeEvent(event);
+      // An event from a wrong clock is listed by when the server received it, which is also how the
+      // API orders it; the controller's own (wrong) timestamp moves to the tooltip.
+      const clockOff = event.clockSkewSeconds !== undefined;
+      const when = clockOff ? event.receivedAt : event.occurredAt;
+      const whenTitle = clockOff
+        ? `Received ${dateTime.format(new Date(event.receivedAt))}; the controller reported ${dateTime.format(new Date(event.occurredAt))}`
+        : dateTime.format(new Date(event.occurredAt));
+      const clockNote = clockOff
+        ? [el('span', { className: 'detail-note' }, [statusBadge({ status: 'warning', icon: 'alert', label: clockSkewLabel(event.clockSkewSeconds) })])]
+        : [];
       return el('tr', {}, [
-        el('td', { className: 'nowrap', text: timeAgo(event.occurredAt), title: dateTime.format(new Date(event.occurredAt)) }),
+        el('td', { className: 'nowrap', text: timeAgo(when), title: whenTitle }),
         el('td', { className: 'nowrap', text: label }),
-        el('td', {}, details),
+        el('td', {}, [...details, ...clockNote]),
       ]);
     }),
   );
