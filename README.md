@@ -6,7 +6,11 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** the core pipeline (ingest → S3 + SQS → processor → DynamoDB → query API, with the DLQ and alarms) runs in AWS (us-east-1) and is verified end to end, including duplicate delivery and a poison message flowing through retries into the DLQ. The features added since are implemented, unit-tested, and awaiting deployment; [Deployment status](#deployment-status) lists which is which. Ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 8 integration tests passing against the live stack and 66 unit tests in CI. [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+
+![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
+
+*The [operations dashboard](#operations-dashboard) on the deployed dev stack, signed in through Cognito, showing sample traffic sent through the API.*
 
 ---
 
@@ -97,12 +101,12 @@ The write path (ingest) and the read path (query) are separate Lambdas with sepa
 | **Amazon EventBridge** | A bus other systems subscribe to with rules (maintenance, loyalty, BI); an archive for replaying events to new subscribers; Scheduler runs the site monitor. | Every new consumer would need a code change in this service. |
 | **Amazon CloudWatch** | Centralized logs (Logs Insights over structured JSON), metrics (including custom ones from logs), alarms, and a dashboard. | No visibility into a distributed system spanning six functions, two queues, and a stream. |
 | **AWS X-Ray** | Per-invocation traces: where time goes (cold start vs. handler), linked across the SQS hop. | Guessing at latency from log timestamps. |
-| **AWS CodeDeploy** | Shifts traffic to each new Lambda version gradually and rolls back automatically if an alarm fires. | A bad deploy hits 100% of traffic at once. |
+| **AWS CodeDeploy** | Shifts traffic to each new Lambda version gradually and rolls back automatically if an alarm fires. Switchable with the `CanaryDeploys` parameter, since AWS free-plan accounts can't use it. | A bad deploy hits 100% of traffic at once. |
 | **Amazon Athena + Glue** | SQL over the raw S3 archive where it sits (nothing copied). | Downloading objects to answer "how many washes did miami-01 do last Tuesday?". |
 | **Amazon CloudFront** | Serves the dashboard over HTTPS from a private bucket, with security headers. | A public bucket, or a web server just for static files. |
 | **Amazon SNS** | Delivers alarm and site alert notifications by email. | Alarms change state in the console but nobody is told. |
 | **AWS IAM** | A dedicated execution role per function, scoped to exactly the resources it uses; an OIDC trust for GitHub Actions. | Shared or wildcard credentials: one bug or compromise could touch everything. |
-| **AWS SAM / CloudFormation** | The whole environment (96 resources after the SAM transform) defined in `template.yaml`: reviewable, repeatable, and removable with one command. | Hand-built console resources that drift and can't be reproduced or code-reviewed. |
+| **AWS SAM / CloudFormation** | The whole environment (89 resources after the SAM transform, 97 with canary deploys) defined in `template.yaml`: reviewable, repeatable, and removable with one command. | Hand-built console resources that drift and can't be reproduced or code-reviewed. |
 
 ## Request flow
 
@@ -165,9 +169,9 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 | Scenario | What happens | Verified |
 |---|---|---|
 | **Invalid event** | Ingest returns `400` with every field error at once. Nothing is written to S3, SQS, or DynamoDB. | ✅ deployed + unit test |
-| **Missing or invalid token** | API Gateway returns `401`; no Lambda runs. A valid token without the route's scope gets `403`. | Integration test |
-| **A site's credential used for another site** (misconfigured or stolen) | Ingest returns `403` before archiving or enqueueing; nothing is stored or counted. | Unit + integration test |
-| **Controller clock is wrong** | The event is accepted (the wash still happened), flagged with `clockSkewSeconds`, sorted by receipt time, and the `controller-clock-skew` alarm fires. Liveness uses server time, so offline detection isn't fooled. | Unit + integration test |
+| **Missing or invalid token** | API Gateway returns `401`; no Lambda runs. A valid token without the route's scope gets `403`. | ✅ deployed + integration test |
+| **A site's credential used for another site** (misconfigured or stolen) | Ingest returns `403` before archiving or enqueueing; nothing is stored or counted. | ✅ deployed + unit + integration test |
+| **Controller clock is wrong** | The event is accepted (the wash still happened), flagged with `clockSkewSeconds`, sorted by receipt time, and the `controller-clock-skew` alarm fires. Liveness uses server time, so offline detection isn't fooled. | ✅ deployed + unit + integration test; the alarm fired |
 | **Ingestion Lambda crashes or times out** | API Gateway returns `5xx`; nothing was acknowledged, so the controller retries. If S3/SQS had already succeeded, the retry produces a duplicate message, which the processor dedupes. | Design |
 | **S3 unavailable** | The SDK retries transient errors (3 attempts, exponential backoff with jitter). If it still fails, ingest returns `500` and does **not** enqueue, preserving "every queued event is archived". | ✅ unit test |
 | **SQS temporarily unavailable** | SDK retries; then `500` to the controller, which retries. The already-written S3 object remains as a harmless receipt of the failed attempt. | Design |
@@ -176,10 +180,10 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 | **Same event delivered twice** | The conditional write detects the existing `eventId`, the transaction is cancelled, and the processor logs `DUPLICATE` and acknowledges the message. Counters are unchanged, and nothing is published twice. | ✅ deployed + unit test |
 | **DynamoDB throttling or errors** | SDK retries first; persistent failure fails that message only, and SQS retries it later. Because each write is one atomic transaction, a retry can never leave a half-applied update. Sustained failure lands messages in the DLQ for redrive after recovery. | ✅ unit test |
 | **Processing stalled** (bad deploy, permissions) | Messages accumulate on the queue (4-day retention). The `processing-stalled` alarm fires when the oldest message is over 5 minutes old. | Design |
-| **EventBridge rejects or is unavailable** | The publisher reports the affected stream records as failed; Lambda retries from the first failure (up to 5 times, splitting the batch to isolate a bad record). After that, the batch's location is sent to the publisher-failures queue and its alarm fires; the [runbook](#runbook) republishes the events. | Unit test |
-| **A site goes silent** | The site monitor marks it `OFFLINE` and emails once; when heartbeats resume it marks it `ONLINE` and emails once more. | Unit test |
+| **EventBridge rejects or is unavailable** | The publisher reports the affected stream records as failed; Lambda retries from the first failure (up to 5 times, splitting the batch to isolate a bad record). After that, the batch's location is sent to the publisher-failures queue and its alarm fires; the [runbook](#runbook) republishes the events. | Unit test; the success path is ✅ deployed (0 failed publishes) |
+| **A site goes silent** | The site monitor marks it `OFFLINE` and emails once; when heartbeats resume it marks it `ONLINE` and emails once more. | ✅ deployed + unit test |
 | **Site alert email fails to send** | The monitor undoes the recorded change and fails the run, so the next run (or Scheduler's retry) sends it. | Unit test |
-| **A deploy introduces errors** | CodeDeploy is shifting traffic to the new version; the `lambda-errors` or `error-logs` alarm fires and CodeDeploy rolls the alias back to the previous version. | Configuration |
+| **A deploy introduces errors** | CodeDeploy is shifting traffic to the new version; the `lambda-errors` or `error-logs` alarm fires and CodeDeploy rolls the alias back to the previous version. | Configuration (`CanaryDeploys=true`) |
 | **Accidental delete of data** | Tables have point-in-time recovery (35 days) and survive a stack delete; archive objects are versioned (deleted or overwritten objects recoverable for 7 days). | Configuration |
 
 ## Idempotency
@@ -392,7 +396,7 @@ API Gateway access logs (`/aws/vendedlogs/washops/http-api-access`) record `requ
 | `OfflineSites` | Site monitor's "Site check complete" log line (EMF) |
 | `ErrorLogs` | A metric filter on every function's log group counting `level = "error"` lines |
 
-**Tracing**: every function has X-Ray active tracing, which shows init vs. handler time per invocation. The AWS SDK adds the trace header to its SQS call, so the processor's trace should link back to the ingest request; confirm it in the X-Ray console after deploying. Per-call subsegments (S3, SQS, DynamoDB latency) would need SDK instrumentation; see future improvements.
+**Tracing**: every function has X-Ray active tracing, which shows init vs. handler time per invocation. The AWS SDK adds the trace header to its SQS call, so each processor trace carries an X-Ray link back to the ingest request that enqueued the message (verified in AWS). Per-call subsegments (S3, SQS, DynamoDB latency) would need SDK instrumentation; see future improvements.
 
 **Alarms** (SNS email):
 
@@ -428,7 +432,7 @@ WHERE received_date = '2026-09-14' AND payload.eventtype = 'WASH_COMPLETED'
 GROUP BY locationid;
 ```
 
-The archive keeps every receipt, so a controller retry appears as a repeated `eventid`; the saved revenue query dedupes on it first. Each day's partition contains `location=` subfolders, which Athena is expected to read recursively; check that the saved queries return rows after deploying. If they don't, add `location` as a second projected partition (type `injected`, so queries must name a site).
+The archive keeps every receipt, so a controller retry appears as a repeated `eventid`; the saved revenue query dedupes on it first. Each day's partition contains `location=` subfolders, which Athena reads recursively (verified in AWS: one day's query returned every receipt across sites, and all three saved queries run). To also prune by site, `location` could become a second projected partition (type `injected`, so queries must name a site).
 
 ## Operations dashboard
 
@@ -565,7 +569,7 @@ One template, two stacks. Every resource name includes the stack name, so both l
 | | dev (`washops-dev`) | prod (`washops`) |
 |---|---|---|
 | Deploy | `sam deploy` | CI after the integration tests pass, or `sam deploy --config-env prod` |
-| Traffic shifting | `AllAtOnce` (fast iteration) | `Canary10Percent5Minutes` with alarm rollback |
+| Traffic shifting | `AllAtOnce` (fast iteration) | `Canary10Percent5Minutes` with alarm rollback, when `CanaryDeploys=true` |
 | Data on stack delete | deleted (`DataRetentionPolicy=Delete`) | retained (`Retain`) |
 | Log retention | 3 days | 14 days |
 | Changeset review | no | yes (local deploys) |
@@ -580,19 +584,22 @@ The production-grade version of this is separate AWS accounts per environment (A
 
 ## Deployment status
 
-The core pipeline is deployed and was verified in AWS by hand. Everything since is implemented and checked on every push by CI (typecheck, lint, unit tests, `sam validate --lint`, `sam build`), and goes live with the next deploy, when the [integration tests](#integration-tests) first run against it.
+Both stacks run in one AWS account (us-east-1, on the AWS free plan). The current release is deployed to **`washops-dev`**, where everything below was verified on 2026-11-09; prod (`washops`) runs the core pipeline and is promoted from the same build.
 
-| Area | Status |
+| Area | Verified in AWS |
 |---|---|
-| Ingest API, S3 archive, SQS with DLQ, idempotent processor, DynamoDB, query API, `dlq-not-empty` and `processing-stalled` alarms | **Deployed.** Duplicate delivery and a poison message (retries → DLQ → alarm) verified in AWS |
-| Cognito authentication and per-site credentials | Unit + integration tests; awaiting deployment |
-| Controller clock checks; heartbeat liveness in server time | Unit + integration tests; awaiting deployment |
-| Offline-site detection and site alerts | Unit tests; awaiting deployment |
-| EventBridge fan-out, fault alerts, replay tool | Unit tests; awaiting deployment |
-| Operations web dashboard | Tested in a browser against a mocked API; awaiting deployment |
-| Extra alarms, CloudWatch dashboard, EMF metrics, X-Ray, Athena | Defined in `template.yaml`; awaiting deployment |
-| Canary deploys with rollback, point-in-time recovery, versioned archive, `maxReceiveCount` 5 | Defined in `template.yaml`; awaiting deployment |
-| dev and prod stacks, GitHub OIDC deploy jobs | Defined; the deploy jobs switch on once the deploy role is set up |
+| Ingest → S3 archive + SQS → idempotent processor → DynamoDB → query API | ✅ All 8 [integration tests](#integration-tests) pass against the live stack; duplicate delivery counted once; poison message → DLQ → alarm |
+| Cognito authentication and per-site credentials | ✅ `401` without a token (no Lambda runs), `403` for another site's events, tokens from the client-credentials flow |
+| Controller clock checks | ✅ `202` with a warning for a clock 2 h ahead, stored with `clockSkewSeconds`; the `controller-clock-skew` alarm fired |
+| EventBridge fan-out and fault alerts | ✅ Every new event published (0 failures); the HIGH-severity rule matched and delivered to SNS |
+| Offline-site detection | ✅ A silent site was marked `OFFLINE` 11 minutes after its last heartbeat and alerted once; the next heartbeat brought it back `ONLINE` with one recovery alert |
+| Replay tool | ✅ Dry run found 19 archived receipts of 16 events, matching Athena |
+| Athena | ✅ All three saved queries run; partitions read across site subfolders |
+| Observability | ✅ X-Ray traces for every function, processor traces linked to the ingest request; custom EMF metrics; 10-widget CloudWatch dashboard; alarms stay `OK` under normal traffic |
+| Operations web dashboard | ✅ Signed in through Cognito's hosted UI in a headless browser and loaded live data (the screenshot above); served by CloudFront with CSP/HSTS headers from a private bucket (direct access `403`) |
+| Data protection | ✅ Point-in-time recovery on both tables, versioned archive, `maxReceiveCount` 5 |
+| Canary deploys with automatic rollback | Defined (`CanaryDeploys=true`); off on this account, whose AWS free plan excludes CodeDeploy |
+| GitHub OIDC deploy jobs | Defined; switch on once `deploy/github-deploy-role.yaml` is deployed and the repository variables are set |
 
 ## AWS deployment
 
@@ -619,7 +626,9 @@ The core pipeline is deployed and was verified in AWS by hand. Everything since 
 
    For alarm and site alert emails, pass your address once: `sam deploy --config-env prod --parameter-overrides AlarmEmail=you@example.com` (confirm both SNS subscription emails). Later deploys keep it.
 
-   > **Deploy time:** in prod, each deploy that changes a function takes at least 5 more minutes while CodeDeploy shifts traffic. The first deploy that creates the CloudFront distribution also takes several minutes.
+   > **Deploy time:** with canary deploys on, each prod deploy that changes a function takes at least 5 more minutes while CodeDeploy shifts traffic. The first deploy that creates the CloudFront distribution also takes several minutes.
+   >
+   > **Canary deploys** need CodeDeploy, which AWS free-plan accounts can't use (calls fail with `SubscriptionRequiredException`). The `samconfig.toml` profiles therefore set `CanaryDeploys="false"`: SAM then creates no CodeDeploy resources, and each deploy moves the `live` alias straight to the new version. Remove that override on an account with CodeDeploy to turn canaries on.
 
    > **Upgrading the existing `washops` stack:** before this change, a plain `sam deploy` updated `washops`. Now it creates `washops-dev`, and prod needs `--config-env prod`.
 
@@ -674,7 +683,7 @@ In prod, `sam delete` leaves the two DynamoDB tables and the raw events bucket i
 | **sam** | install SAM CLI → `sam validate --lint` (cfn-lint) → `sam build` → upload the build as an artifact |
 | **deploy-dev** *(main only, once set up)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
 | **integration-tests** | `npm run test:integration` against `washops-dev` |
-| **deploy-prod** | the **same build** → `sam deploy --config-env ci-prod`; waits for the canary |
+| **deploy-prod** | the **same build** → `sam deploy --config-env ci-prod`; waits for the canary when `CanaryDeploys=true` |
 
 **Build once, promote.** The `sam` job builds the Lambda bundles once; dev and prod deploy that exact artifact, so prod runs precisely the code that passed the integration tests. A failure at any step stops the pipeline before prod.
 
@@ -702,7 +711,7 @@ The AWS jobs are skipped until `AWS_DEPLOY_ROLE_ARN` exists, so CI keeps working
 
 ## API reference and examples
 
-Responses below were captured from the deployed stack before authentication was added; the bodies are unchanged. The base URL is the `ApiBaseUrl` stack output. Every request now needs `Authorization: Bearer <access token>`; get one from the `TokenUrl` output:
+Responses below are real responses from the deployed stack. The base URL is the `ApiBaseUrl` stack output. Every request needs `Authorization: Bearer <access token>`; get one from the `TokenUrl` output:
 
 ```bash
 TOKEN=$(curl -s -u "$WASHOPS_CLIENT_ID:$WASHOPS_CLIENT_SECRET" "$WASHOPS_TOKEN_URL" \
@@ -794,39 +803,44 @@ HTTP 202
 HTTP 200
 {
   "locationId": "miami-01",
-  "washesStarted": 1,
-  "completedWashes": 2,
-  "totalRevenue": 44,
-  "paymentsCompleted": 1,
-  "paymentVolume": 22,
+  "washesStarted": 9,
+  "completedWashes": 10,
+  "totalRevenue": 214,
+  "paymentsCompleted": 9,
+  "paymentVolume": 192,
   "equipmentFaults": 1,
-  "lastHeartbeat": "2026-09-14T23:38:58.809Z",
-  "lastUpdated": "2026-09-14T23:39:00.670Z"
+  "lastHeartbeat": "2026-11-09T19:32:01.015Z",
+  "controllerClockSkewSeconds": -1,
+  "connectivity": "ONLINE",
+  "connectivityChangedAt": null,
+  "lastUpdated": "2026-11-09T19:32:06.315Z"
 }
 ```
 
-This was captured after sending three `WASH_COMPLETED` requests, one of which was a duplicate `eventId`, so `completedWashes` is 2. Summaries now also include `connectivity` (`ONLINE` / `OFFLINE` / `UNKNOWN`), `connectivityChangedAt`, and `controllerClockSkewSeconds`, which this capture predates; `lastHeartbeat` is the server's receipt time.
+`lastHeartbeat` is when the server received the latest heartbeat, and `controllerClockSkewSeconds` is how far that controller's clock was off (here 1 s behind). `connectivity` is the site monitor's verdict: `ONLINE`, `OFFLINE`, or `UNKNOWN` before the first heartbeat; `connectivityChangedAt` is when it last changed.
 
 ### `GET /locations`
 
-Every location's summary, sorted by `locationId`: `{ "count": 2, "locations": [ { ...summary }, ... ] }`.
+Every location's summary, sorted by `locationId`: `{ "count": 1, "locations": [ { ...summary }, ... ] }`.
 
 ### `GET /events/{eventId}`
 
 ```json
 HTTP 200
 {
-  "eventId": "evt-1001",
+  "eventId": "evt-mw9nqrm2-8-done",
   "locationId": "miami-01",
   "eventType": "WASH_COMPLETED",
-  "occurredAt": "2026-09-14T18:30:00.000Z",
-  "receivedAt": "2026-09-14T23:34:36.768Z",
-  "processedAt": "2026-09-14T23:34:38.272Z",
-  "correlationId": "demo-trace-0001",
-  "archiveKey": "raw/date=2026-09-14/location=miami-01/evt-1001_demo-trace-0001.json",
-  "data": { "washPackage": "Premium", "amount": 22, "durationSeconds": 312 }
+  "occurredAt": "2026-11-09T19:30:00.459Z",
+  "receivedAt": "2026-11-09T19:32:05.987Z",
+  "processedAt": "2026-11-09T19:32:06.078Z",
+  "correlationId": "6be9a057-4c44-446e-a6d8-431ccb3b6bdd",
+  "archiveKey": "raw/date=2026-11-09/location=miami-01/evt-mw9nqrm2-8-done_6be9a057-4c44-446e-a6d8-431ccb3b6bdd.json",
+  "data": { "washPackage": "Ultimate", "amount": 30, "durationSeconds": 336 }
 }
 ```
+
+`processedAt` minus `receivedAt` is the asynchronous hop: here 91 ms from API receipt, through SQS, to the DynamoDB write. An event from a controller with a wrong clock also carries `clockSkewSeconds` (`"occurredAt": "2026-11-09T21:32:00.459Z"`, `"receivedAt": "2026-11-09T19:32:06.091Z"`, `"clockSkewSeconds": 7194`).
 
 Returns `404` if the event has not been processed, including an event that was accepted and is still on the queue.
 
