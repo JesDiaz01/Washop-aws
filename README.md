@@ -6,11 +6,20 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack and 71 unit tests in CI. [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 73 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
 *The [operations dashboard](#operations-dashboard) on the deployed dev stack, signed in through Cognito, showing sample traffic sent through the API.*
+
+### At a glance
+
+- **Never loses or double-counts an event.** Every payload is archived to S3 before it's queued, and the processor records each event and its revenue in one DynamoDB transaction keyed by the event ID. In the [load test](#load-test), 1,000 events plus 50 duplicate deliveries were counted exactly once.
+- **The API stays fast when processing doesn't.** Ingest returns `202` once the event is durable; SQS absorbs bursts and outages, with retries, a dead-letter queue, and alarms.
+- **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
+- **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
+- **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 73 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -161,7 +170,7 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 
 - **Partial batch responses** (`ReportBatchItemFailures`): the handler returns only the IDs of messages that failed. Successful messages in the same batch are deleted instead of being reprocessed.
 - **Visibility timeout (60 s):** a received message is hidden from other consumers while it is being processed. It is 6× the function timeout, per AWS guidance, so a slow invocation doesn't cause the same message to be delivered to a second consumer mid-flight.
-- **Bounded concurrency** (`MaximumConcurrency: 5`): caps parallel consumers so a large backlog drains steadily instead of stampeding downstream systems.
+- **Bounded concurrency** (`MaximumConcurrency: 2`): caps parallel consumers so a large backlog drains steadily instead of stampeding downstream systems. The [load test](#load-test) set the number: the API's own throttle (25 requests/s) bounds inflow, one consumer handles well over that, and every concurrent slot the processor doesn't take is left for the API.
 - **Measured latency:** warm processing took roughly 60–150 ms from `receivedAt` to `processedAt`; cold starts added about 0.4–0.5 s of init time per function.
 
 ## Reliability and failure handling
@@ -178,6 +187,7 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 | **Processor throws** (bug, DynamoDB error) | That message is reported in `batchItemFailures`, stays on the queue, and reappears after the visibility timeout for another attempt. Other messages in the batch are unaffected. | ✅ unit test |
 | **Poison message** (can never succeed) | Fails on every receive. After `maxReceiveCount` (now 5) SQS moves it to the DLQ with its original body and ID; the DLQ alarm notifies via SNS. | ✅ deployed with `maxReceiveCount` 3: 3 attempts ~60 s apart, moved to DLQ, alarm fired ~2.5 min later |
 | **Same event delivered twice** | The conditional write detects the existing `eventId`, the transaction is cancelled, and the processor logs `DUPLICATE` and acknowledges the message. Counters are unchanged, and nothing is published twice. | ✅ deployed + unit test |
+| **Concurrent updates to one site's counters** | DynamoDB cancels all but one conflicting transaction (`TransactionConflict`). The processor retries it in process with jittered backoff and hands a persistent conflict back to SQS. Nothing is written twice, because a cancelled transaction writes nothing. | ✅ [load test](#load-test) + unit test |
 | **DynamoDB throttling or errors** | SDK retries first; persistent failure fails that message only, and SQS retries it later. Because each write is one atomic transaction, a retry can never leave a half-applied update. Sustained failure lands messages in the DLQ for redrive after recovery. | ✅ unit test |
 | **Processing stalled** (bad deploy, permissions) | Messages accumulate on the queue (4-day retention). The `processing-stalled` alarm fires when the oldest message is over 5 minutes old. | Design |
 | **EventBridge rejects or is unavailable** | The publisher reports the affected stream records as failed; Lambda retries from the first failure (up to 5 times, splitting the batch to isolate a bad record). After that, the batch's location is sent to the publisher-failures queue and its alarm fires; the [runbook](#runbook) republishes the events. | Unit test; the success path is ✅ deployed (0 failed publishes) |
@@ -525,13 +535,13 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 71 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 73 tests across 7 files.
 
 | Area | What is tested |
 |---|---|
 | Validation | Valid events; missing/unsafe IDs; non-ISO timestamps; negative and sub-cent amounts; unsupported `eventType` message; UTC normalization; unknown fields stripped |
 | Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON; S3 failure returns `500` and does not enqueue |
-| Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
+| Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; a transaction conflict retried in process, and given back to SQS if it persists; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
 | Clocks and site access | Backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
 | Query | Cents → dollars mapping; connectivity in summaries; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
@@ -561,6 +571,30 @@ WASHOPS_STACK=other-stack npm run test:integration
 ```
 
 They write real data, so they run against dev, never prod. CI runs them after every dev deploy and only promotes to prod if they pass.
+
+### Load test
+
+`scripts/load-test.mjs` sends events to a deployed dev stack at a fixed rate, mixes in duplicate deliveries, waits for processing, and checks the counters. Requests start on schedule whether or not earlier ones have finished, so slow responses show up as latency instead of quietly lowering the rate. It refuses to run against prod.
+
+```bash
+node scripts/load-test.mjs washops-dev --events 1000 --rate 20 --duplicates 0.05
+```
+
+Run on 2026-11-09 against `washops-dev`: 1,000 `WASH_COMPLETED` events plus 50 duplicate deliveries at 20 requests/s, sent from a home connection (latency includes the round trip to us-east-1).
+
+| | First run | After the fixes below |
+|---|---|---|
+| Counted | 1,000 of 1,000; revenue exactly $10,000 | same |
+| Dead-letter queue | 0 | 0 |
+| API latency p50 / p95 / p99 | 86 / 159 / 760 ms | 85 / 158 / 300 ms |
+| Processing, API receipt → DynamoDB, p50 / p95 / max | 76 ms / 176 ms / 60 s | 88 ms / 365 ms / 784 ms |
+| Queue drained after the last request | 78.6 s | 0.24 s |
+| `503`s from API Gateway (retried; none lost) | 43 | 6 |
+
+What the first run found:
+
+- **Transaction conflicts on a busy site's summary item.** Concurrent processors updating the same counters made DynamoDB cancel 41 transactions with `TransactionConflict`. Nothing was lost or double-counted, but each message waited out the 60 s visibility timeout before SQS redelivered it. The processor now retries a conflict in process with jittered backoff, which is safe because a cancelled transaction wrote nothing (slightly higher p95, no 60 s stalls). The second run logged no processing errors.
+- **The account's Lambda concurrency limit.** New AWS accounts can run 10 Lambda environments at once, shared by every function in both stacks. With the processor allowed 5, the API ran out of room and API Gateway returned `503`. The API's own throttle (25 requests/s) caps inflow and one processor handles over 100 events/s, so `MaximumConcurrency` is now 2. The remaining `503`s all fell in the first minute, while new ingest environments started; the fix for those is a concurrency quota increase, not code.
 
 End-to-end behavior of the core pipeline was verified by hand against the deployed stack (see [API reference and examples](#api-reference-and-examples)).
 
@@ -595,6 +629,7 @@ Both stacks run the current release in one AWS account (us-east-1, on the AWS fr
 | Controller clock checks | ✅ `202` with a warning for a clock 2 h ahead, stored with `clockSkewSeconds`; the `controller-clock-skew` alarm fired |
 | EventBridge fan-out and fault alerts | ✅ Every new event published (0 failures); the HIGH-severity rule matched and delivered to SNS |
 | Offline-site detection | ✅ A silent site was marked `OFFLINE` 11 minutes after its last heartbeat and alerted once; the next heartbeat brought it back `ONLINE` with one recovery alert |
+| Load | ✅ 1,000 events plus 50 duplicates at 20 requests/s counted exactly once, nothing in the DLQ ([load test](#load-test)) |
 | Replay tool | ✅ Dry run found 19 archived receipts of 16 events, matching Athena |
 | Athena | ✅ All three saved queries run; partitions read across site subfolders |
 | Observability | ✅ X-Ray traces for every function, processor traces linked to the ingest request; custom EMF metrics; 10-widget CloudWatch dashboard; alarms stay `OK` under normal traffic |
@@ -915,7 +950,7 @@ These are **not implemented**:
 - **Environments:** separate AWS accounts per environment under AWS Organizations; a manual approval gate before prod (GitHub environment protection rules, with the OIDC trust policy keyed to that environment); a staging stage with production-like data.
 - **Observability:** SDK-level tracing (Powertools for AWS Lambda or OpenTelemetry) for per-call subsegments; Powertools could also replace the hand-written logger and EMF helper. Alarms on DynamoDB throttling.
 - **Data durability:** lifecycle transition to Glacier instead of expiry, and S3 Object Lock where audit retention is regulated; customer-managed KMS keys if required.
-- **Scale:** Kinesis Data Streams or Firehose for very high event rates and batched archiving; FIFO queues with `MessageGroupId = locationId` if strict per-site ordering becomes a requirement; reserved concurrency; pagination tokens on list endpoints; Step Functions or S3 Batch Operations for large replays.
+- **Scale:** Kinesis Data Streams or Firehose for very high event rates and batched archiving; FIFO queues with `MessageGroupId = locationId` if strict per-site ordering becomes a requirement; a Lambda concurrency quota increase, then reserved concurrency so the API can never be starved by background work (the [load test](#load-test) hit the 10-environment default); for one very busy site, sharded counters or one aggregated update per batch instead of per event; pagination tokens on list endpoints; Step Functions or S3 Batch Operations for large replays.
 - **Relational integration:** location master data (sites, owners, pricing) typically lives in a relational system such as Aurora PostgreSQL. A natural pattern is an EventBridge rule → Lambda → PostgreSQL for reporting, or enrichment from the relational system on the read path, using RDS Proxy for connection pooling.
 - **Schema evolution:** versioned event contracts (`schemaVersion`), contract tests shared with controller firmware teams, and a schema registry (EventBridge Schema Registry fits the bus).
 - **Clocks:** alert per site (today the alarm is fleet-wide and the dashboard names the site), and have controllers sync from a time source the API provides.
