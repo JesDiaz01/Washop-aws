@@ -28,6 +28,11 @@ Parameters:
     Default: Canary10Percent5Minutes
     AllowedValues: [Canary10Percent5Minutes, Linear10PercentEvery1Minute, AllAtOnce]
     Description: How new Lambda versions take traffic (AllAtOnce for fast iteration in a dev stack)
+  CanaryDeploys:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Shift traffic with CodeDeploy and roll back on alarms. 'false' where CodeDeploy is unavailable (e.g. AWS free-plan accounts); deploys then switch the live alias at once
   DataRetentionPolicy:
     Type: String
     Default: Retain
@@ -46,9 +51,11 @@ Globals:
     Tracing: Active # X-Ray: per-invocation timing (init vs. handler), linked across the SQS hop
     # Every deploy publishes a version behind a "live" alias; API routes, the queue, the stream, and
     # the schedule all invoke the alias. CodeDeploy shifts traffic to the new version gradually and
-    # rolls back automatically if either alarm fires during the shift.
+    # rolls back automatically if either alarm fires during the shift. With CanaryDeploys=false, SAM
+    # creates no CodeDeploy resources and each deploy moves the alias straight to the new version.
     AutoPublishAlias: live
     DeploymentPreference:
+      Enabled: !Ref CanaryDeploys
       Type: !Ref DeploymentStrategy
       Alarms:
         - !Ref LambdaErrorsAlarm
@@ -844,6 +851,7 @@ Resources:
         EveryFiveMinutes:
           Type: ScheduleV2 # EventBridge Scheduler; SAM creates a role that can invoke only this function
           Properties:
+            Name: !Sub ${AWS::StackName}-site-monitor # schedule names are per account; SAM's default would clash between stacks
             ScheduleExpression: rate(5 minutes)
             Description: Check every site's last heartbeat
             RetryPolicy:

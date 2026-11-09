@@ -11,6 +11,9 @@ version = 0.1
 #
 # CAPABILITY_AUTO_EXPAND acknowledges the AWS::LanguageExtensions transform (it lets DeletionPolicy
 # come from a parameter). CloudFormation can refuse a transform template without it.
+#
+# CanaryDeploys="false" in every profile: the account these stacks run in is on the AWS free plan,
+# where CodeDeploy calls fail with SubscriptionRequiredException. Remove it to turn canaries back on.
 
 [default.global.parameters]
 stack_name = "washops-dev"
@@ -24,7 +27,7 @@ resolve_s3 = true
 s3_prefix = "washops-dev"
 confirm_changeset = false
 capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
-parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\""
+parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\" CanaryDeploys=\"false\""
 tags = "Project=\"washops\" Environment=\"dev\""
 image_repositories = []
 
@@ -40,7 +43,7 @@ capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
 # AlarmEmail is intentionally not stored here (keeps personal data out of git).
 # First deploy:  sam deploy --config-env prod --parameter-overrides AlarmEmail=you@example.com
 # Later deploys reuse the stack's previous parameter values automatically.
-parameter_overrides = "LogRetentionDays=\"14\""
+parameter_overrides = "LogRetentionDays=\"14\" CanaryDeploys=\"false\""
 tags = "Project=\"washops\" Environment=\"prod\""
 image_repositories = []
 
@@ -56,7 +59,7 @@ s3_prefix = "washops-dev"
 capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
 confirm_changeset = false
 fail_on_empty_changeset = false
-parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\""
+parameter_overrides = "LogRetentionDays=\"3\" DeploymentStrategy=\"AllAtOnce\" DataRetentionPolicy=\"Delete\" CanaryDeploys=\"false\""
 tags = "Project=\"washops\" Environment=\"dev\""
 
 [ci-prod.global.parameters]
@@ -68,5 +71,5 @@ s3_prefix = "washops"
 capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
 confirm_changeset = false
 fail_on_empty_changeset = false
-parameter_overrides = "LogRetentionDays=\"14\""
+parameter_overrides = "LogRetentionDays=\"14\" CanaryDeploys=\"false\""
 tags = "Project=\"washops\" Environment=\"prod\""
