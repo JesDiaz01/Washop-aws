@@ -123,4 +123,22 @@ describe('processor handler (SQS consumer)', () => {
     // Heartbeats are kept out of the location activity GSI (sparse index).
     expect(ddbMock.commandCalls(PutCommand)[0]!.args[0].input.Item).not.toHaveProperty('activityAt');
   });
+
+  it('never lets a heartbeat overwrite a different event that has the same eventId', async () => {
+    // e.g. another site's WASH_COMPLETED already stored under this ID.
+    ddbMock
+      .on(PutCommand)
+      .rejects(new ConditionalCheckFailedException({ message: 'The conditional request failed', $metadata: {} }));
+
+    const result = await handler(sqsEvent([messageFor(heartbeatPayload())]), lambdaContext);
+
+    expect(result.batchItemFailures).toEqual([]);
+    const put = ddbMock.commandCalls(PutCommand)[0]!.args[0].input;
+    expect(put.ConditionExpression).toBe(
+      'attribute_not_exists(eventId) OR (eventType = :heartbeat AND locationId = :locationId)',
+    );
+    expect(put.ExpressionAttributeValues).toEqual({ ':heartbeat': 'CONTROLLER_HEARTBEAT', ':locationId': 'miami-01' });
+    // Liveness is not touched either: the heartbeat was dropped.
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
 });

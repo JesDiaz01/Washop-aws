@@ -166,11 +166,28 @@ export async function recordEvent(envelope: QueueEnvelope, now = new Date()): Pr
  * T is the server's receipt time, not the controller's timestamp: a controller with a wrong clock
  * must not look offline (clock behind) or stay "online" after it goes silent (clock ahead). The
  * gap between the two is stored as the controller's clock error.
+ *
+ * The Put may overwrite only this same heartbeat (a redelivery). Without that condition, a heartbeat
+ * reusing another event's ID would replace that event, even one from a different site.
  */
 async function recordHeartbeat(item: EventItem, now: Date): Promise<RecordOutcome> {
   const client = getDynamoClient();
 
-  await client.send(new PutCommand({ TableName: eventsTable(), Item: item }));
+  try {
+    await client.send(
+      new PutCommand({
+        TableName: eventsTable(),
+        Item: item,
+        ConditionExpression: 'attribute_not_exists(eventId) OR (eventType = :heartbeat AND locationId = :locationId)',
+        ExpressionAttributeValues: { ':heartbeat': 'CONTROLLER_HEARTBEAT', ':locationId': item.locationId },
+      }),
+    );
+  } catch (error) {
+    if (error instanceof ConditionalCheckFailedException) {
+      return 'DUPLICATE'; // the ID belongs to a different event, which stays as it was
+    }
+    throw error;
+  }
 
   try {
     await client.send(

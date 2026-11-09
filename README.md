@@ -195,7 +195,7 @@ TransactWriteItems (all-or-nothing)
 
 - The **event record and the counter increment commit atomically.** Writing them separately would open a window where a crash either loses the increment or double-counts on retry.
 - If the `eventId` already exists, DynamoDB cancels the transaction with `ConditionalCheckFailed` on item 0. The processor treats that as success (`DUPLICATE`) so SQS deletes the message instead of retrying it.
-- **Heartbeats take a different path on purpose.** "Move `lastHeartbeat` forward to T" is *naturally* idempotent, so it uses a single conditional update (`lastHeartbeat < :ts`). That also prevents an out-of-order, older heartbeat from moving the value backwards, since standard SQS does not guarantee ordering. T is the server's receipt time *(not yet deployed; previously the controller's timestamp)*, so a controller's wrong clock can't affect liveness.
+- **Heartbeats take a different path on purpose.** "Move `lastHeartbeat` forward to T" is *naturally* idempotent, so it uses a single conditional update (`lastHeartbeat < :ts`). That also prevents an out-of-order, older heartbeat from moving the value backwards, since standard SQS does not guarantee ordering. T is the server's receipt time *(not yet deployed; previously the controller's timestamp)*, so a controller's wrong clock can't affect liveness. The heartbeat's own record may replace only an earlier copy of itself *(not yet deployed)*: a heartbeat that reuses another event's ID is dropped, so it can never overwrite a wash or payment record, even one from another site.
 - Money is stored as **integer cents** (`19.99 * 100 === 1998.9999999999998` in JavaScript).
 - The same idea carries through the rest of the system: a duplicate never inserts a new item, so it never produces a stream record and is never published to EventBridge; replaying archived events is safe; and connectivity changes are claimed with conditional writes so they alert once.
 
@@ -519,7 +519,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 65 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 66 tests across 7 files.
 
 | Area | What is tested |
 |---|---|
