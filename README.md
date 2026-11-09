@@ -584,7 +584,7 @@ The production-grade version of this is separate AWS accounts per environment (A
 
 ## Deployment status
 
-Both stacks run in one AWS account (us-east-1, on the AWS free plan). The current release is deployed to **`washops-dev`**, where everything below was verified on 2026-11-09; prod (`washops`) runs the core pipeline and is promoted from the same build.
+Both stacks run the current release in one AWS account (us-east-1, on the AWS free plan), deployed from the same build. Everything below was verified on **`washops-dev`** on 2026-11-09, where the integration tests are allowed to write data. Prod (`washops`) was then upgraded in place from its original version and checked with read-only requests: the API now returns `401` without a token, the existing events and counters came through unchanged, and the site monitor flagged the long-silent demo site and alerted by email.
 
 | Area | Verified in AWS |
 |---|---|
@@ -629,8 +629,6 @@ Both stacks run in one AWS account (us-east-1, on the AWS free plan). The curren
    > **Deploy time:** with canary deploys on, each prod deploy that changes a function takes at least 5 more minutes while CodeDeploy shifts traffic. The first deploy that creates the CloudFront distribution also takes several minutes.
    >
    > **Canary deploys** need CodeDeploy, which AWS free-plan accounts can't use (calls fail with `SubscriptionRequiredException`). The `samconfig.toml` profiles therefore set `CanaryDeploys="false"`: SAM then creates no CodeDeploy resources, and each deploy moves the `live` alias straight to the new version. Remove that override on an account with CodeDeploy to turn canaries on.
-
-   > **Upgrading the existing `washops` stack:** before this change, a plain `sam deploy` updated `washops`. Now it creates `washops-dev`, and prod needs `--config-env prod`.
 
 3. **Get the demo site's credentials and send events:**
 
