@@ -718,15 +718,15 @@ In prod, `sam delete` leaves the two DynamoDB tables and the raw events bucket i
 | **sam** | install SAM CLI → `sam validate --lint` (cfn-lint) → `sam build` → upload the build as an artifact |
 | **deploy-dev** *(main only, once set up)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
 | **integration-tests** | `npm run test:integration` against `washops-dev` |
-| **deploy-prod** | the **same build** → `sam deploy --config-env ci-prod`; waits for the canary when `CanaryDeploys=true` |
+| **deploy-prod** | **waits for a reviewer's approval** (GitHub `production` environment) → the **same build** → `sam deploy --config-env ci-prod`; waits for the canary when `CanaryDeploys=true` |
 
-**Build once, promote.** The `sam` job builds the Lambda bundles once; dev and prod deploy that exact artifact, so prod runs precisely the code that passed the integration tests. A failure at any step stops the pipeline before prod.
+**Build once, promote.** The `sam` job builds the Lambda bundles once; dev and prod deploy that exact artifact, so prod runs precisely the code that passed the integration tests. A failure at any step stops the pipeline before prod, and prod itself only changes when a person approves the run after seeing dev pass.
 
 The workflow's token is limited to `contents: read`; only the AWS jobs may request an OIDC token (`id-token: write`). Pull request runs are cancelled when superseded, but runs on `main` queue, so one pipeline at a time deploys dev, tests it, and promotes it.
 
 ### Continuous deployment with GitHub OIDC
 
-No AWS access keys are stored in GitHub. On each run, GitHub issues a signed, short-lived token; AWS STS exchanges it for temporary credentials of a deploy role whose trust policy accepts only this repository's `main` branch.
+No AWS access keys are stored in GitHub. On each run, GitHub issues a signed, short-lived token; AWS STS exchanges it for temporary credentials of a deploy role whose trust policy accepts exactly two identities from this repository: runs on `main` (deploy dev, run the tests), and the prod job, whose token names the `production` environment instead of the branch. That environment requires a reviewer's approval and accepts only `main`, so the approval gate is enforced by GitHub and the trust policy together.
 
 The deploy role can do almost nothing by itself: upload artifacts to one bucket, run CloudFormation change sets on the `washops-dev` and `washops` stacks, and read the dev test credential for the integration tests. It hands CloudFormation a separate **execution role** that holds the permissions to create resources: all services except IAM via `PowerUserAccess`, plus IAM limited to roles named `washops-*`, with an explicit **Deny** on the setup stack's own roles so an app template can never widen its own deploy permissions.
 
@@ -741,6 +741,7 @@ The deploy role can do almost nothing by itself: upload artifacts to one bucket,
    ```
 
 2. In the GitHub repository, under **Settings → Secrets and variables → Actions → Variables**, add `AWS_DEPLOY_ROLE_ARN`, `CFN_EXECUTION_ROLE_ARN`, and `SAM_ARTIFACTS_BUCKET` from those outputs.
+3. Under **Settings → Environments**, create `production`: add yourself as a **required reviewer**, and limit **deployment branches** to `main`.
 
 The AWS jobs are skipped until `AWS_DEPLOY_ROLE_ARN` exists, so CI keeps working before setup. Deploys keep each stack's current parameter values (including `AlarmEmail`).
 
@@ -947,7 +948,7 @@ HTTP 200
 These are **not implemented**:
 
 - **Device identity at fleet scale:** past ~98 sites, replace per-site scopes with a client → site mapping (a Lambda authorizer with a cached lookup table, or a Cognito pre-token-generation trigger adding a site claim), or move controllers to AWS IoT Core with an X.509 certificate per device. Add AWS WAF (via CloudFront or a REST API).
-- **Environments:** separate AWS accounts per environment under AWS Organizations; a manual approval gate before prod (GitHub environment protection rules, with the OIDC trust policy keyed to that environment); a staging stage with production-like data.
+- **Environments:** separate AWS accounts per environment under AWS Organizations; a staging stage with production-like data.
 - **Observability:** SDK-level tracing (Powertools for AWS Lambda or OpenTelemetry) for per-call subsegments; Powertools could also replace the hand-written logger and EMF helper. Alarms on DynamoDB throttling.
 - **Data durability:** lifecycle transition to Glacier instead of expiry, and S3 Object Lock where audit retention is regulated; customer-managed KMS keys if required.
 - **Scale:** Kinesis Data Streams or Firehose for very high event rates and batched archiving; FIFO queues with `MessageGroupId = locationId` if strict per-site ordering becomes a requirement; a Lambda concurrency quota increase, then reserved concurrency so the API can never be starved by background work (the [load test](#load-test) hit the 10-environment default); for one very busy site, sharded counters or one aggregated update per batch instead of per event; pagination tokens on list endpoints; Step Functions or S3 Batch Operations for large replays.

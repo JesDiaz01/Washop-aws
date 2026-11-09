@@ -19,6 +19,10 @@ Parameters:
     Type: String
     Default: washops-dev
     Description: Name of the dev stack the pipeline deploys and tests first (must match samconfig.toml)
+  ProductionEnvironment:
+    Type: String
+    Default: production
+    Description: GitHub environment the prod deploy job runs in (protect it with a required reviewer, main only)
   CreateOidcProvider:
     Type: String
     Default: 'true'
@@ -128,7 +132,7 @@ Resources:
   GitHubDeployRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: !Sub Assumed by GitHub Actions (${GitHubRepository}, main branch) to deploy ${DevStackName} and ${AppStackName}
+      Description: !Sub Assumed by GitHub Actions (${GitHubRepository}, main branch and the ${ProductionEnvironment} environment) to deploy ${DevStackName} and ${AppStackName}
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -143,8 +147,12 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                # Only workflow runs on main in this repository; pull requests and forks get nothing.
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:ref:refs/heads/main
+                # Only this repository: runs on main (dev deploy and tests), and the prod job, whose token
+                # names its GitHub environment instead of the branch. That environment requires a
+                # reviewer's approval and only accepts main. Pull requests and forks get nothing.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubRepository}:ref:refs/heads/main
+                  - !Sub repo:${GitHubRepository}:environment:${ProductionEnvironment}
       Policies:
         - PolicyName: deploy-app-stack
           PolicyDocument:
