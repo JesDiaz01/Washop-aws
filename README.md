@@ -1,5 +1,7 @@
 # WashOps: Serverless Car Wash Event Integration Service
 
+[![CI](https://github.com/JesDiaz01/Washop-aws/actions/workflows/ci.yml/badge.svg)](https://github.com/JesDiaz01/Washop-aws/actions/workflows/ci.yml)
+
 An event-driven integration layer on AWS that ingests operational events from car wash equipment controllers (washes, payments, equipment faults, heartbeats), archives every raw payload, processes events asynchronously and idempotently, publishes them to other systems, detects sites that go offline, and exposes per-location operational summaries through an authenticated HTTP API and a web dashboard.
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
