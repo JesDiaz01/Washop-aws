@@ -6,9 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** the core pipeline (ingest → S3 + SQS → processor → DynamoDB → query API, with the DLQ and alarms) is deployed to a personal AWS account (us-east-1) and verified end to end, including duplicate delivery and a poison message flowing through retries into the DLQ.
->
-> Later rounds of features are **built and tested locally but not yet deployed**: API authentication with per-site credentials, controller clock checks, offline-site detection, EventBridge fan-out, canary deploys, dev and prod environments, the GitHub OIDC pipeline with integration tests, the replay tool, Athena, the extra alarms and dashboard, and the web dashboard. They are marked *(not yet deployed)* below until they have been verified in AWS. Anything conceptual is listed under [future improvements](#future-production-improvements).
+> **Status:** the core pipeline (ingest → S3 + SQS → processor → DynamoDB → query API, with the DLQ and alarms) runs in AWS (us-east-1) and is verified end to end, including duplicate delivery and a poison message flowing through retries into the DLQ. The features added since are implemented, unit-tested, and awaiting deployment; [Deployment status](#deployment-status) lists which is which. Ideas not yet built are under [future improvements](#future-production-improvements).
 
 ---
 
@@ -33,6 +31,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - [Local development](#local-development)
 - [Testing](#testing)
 - [Environments](#environments)
+- [Deployment status](#deployment-status)
 - [AWS deployment](#aws-deployment)
 - [CI/CD](#cicd)
 - [API reference and examples](#api-reference-and-examples)
@@ -144,10 +143,10 @@ sequenceDiagram
     PR-->>Q: batchItemFailures (only failed message IDs are retried)
 ```
 
-1. **Authenticate at the gateway** *(not yet deployed)*. API Gateway's JWT authorizer rejects requests without a valid Cognito token (`401`) or without the route's scope (`403`) before any Lambda runs, so unauthenticated traffic costs nothing.
+1. **Authenticate at the gateway**. API Gateway's JWT authorizer rejects requests without a valid Cognito token (`401`) or without the route's scope (`403`) before any Lambda runs, so unauthenticated traffic costs nothing.
 2. **Validate at the edge.** The body is parsed and validated against a discriminated union of five event schemas. Timestamps are normalized to UTC, and money must have at most two decimal places.
-3. **Check the site** *(not yet deployed)*. The token must carry `washops/site.<locationId>` for the event's location, or ingest returns `403` and stores nothing. See [Security and IAM](#security-and-iam).
-4. **Check the clock** *(not yet deployed)*. A timestamp far from server time is accepted but flagged, with a warning in the response. See [Controller clocks](#controller-clocks).
+3. **Check the site**. The token must carry `washops/site.<locationId>` for the event's location, or ingest returns `403` and stores nothing. See [Security and IAM](#security-and-iam).
+4. **Check the clock**. A timestamp far from server time is accepted but flagged, with a warning in the response. See [Controller clocks](#controller-clocks).
 5. **Correlation ID.** A caller-supplied `x-correlation-id` is reused if well-formed; otherwise a UUID is generated. It is returned in the response, carried through SQS, logged by every function, and stored on the DynamoDB item.
 6. **Archive first, then enqueue.** Every message on the queue therefore has a raw S3 record behind it, including which client credential sent it.
 7. **Return `202 Accepted`.** The contract is "durably received", not "processed".
@@ -166,9 +165,9 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 | Scenario | What happens | Verified |
 |---|---|---|
 | **Invalid event** | Ingest returns `400` with every field error at once. Nothing is written to S3, SQS, or DynamoDB. | ✅ deployed + unit test |
-| **Missing or invalid token** | API Gateway returns `401`; no Lambda runs. A valid token without the route's scope gets `403`. | Not yet deployed |
-| **A site's credential used for another site** (misconfigured or stolen) | Ingest returns `403` before archiving or enqueueing; nothing is stored or counted. | Unit + integration test; not yet deployed |
-| **Controller clock is wrong** | The event is accepted (the wash still happened), flagged with `clockSkewSeconds`, sorted by receipt time, and the `controller-clock-skew` alarm fires. Liveness uses server time, so offline detection isn't fooled. | Unit + integration test; not yet deployed |
+| **Missing or invalid token** | API Gateway returns `401`; no Lambda runs. A valid token without the route's scope gets `403`. | Integration test |
+| **A site's credential used for another site** (misconfigured or stolen) | Ingest returns `403` before archiving or enqueueing; nothing is stored or counted. | Unit + integration test |
+| **Controller clock is wrong** | The event is accepted (the wash still happened), flagged with `clockSkewSeconds`, sorted by receipt time, and the `controller-clock-skew` alarm fires. Liveness uses server time, so offline detection isn't fooled. | Unit + integration test |
 | **Ingestion Lambda crashes or times out** | API Gateway returns `5xx`; nothing was acknowledged, so the controller retries. If S3/SQS had already succeeded, the retry produces a duplicate message, which the processor dedupes. | Design |
 | **S3 unavailable** | The SDK retries transient errors (3 attempts, exponential backoff with jitter). If it still fails, ingest returns `500` and does **not** enqueue, preserving "every queued event is archived". | ✅ unit test |
 | **SQS temporarily unavailable** | SDK retries; then `500` to the controller, which retries. The already-written S3 object remains as a harmless receipt of the failed attempt. | Design |
@@ -177,11 +176,11 @@ The processor is triggered by an **SQS event source mapping**: the Lambda servic
 | **Same event delivered twice** | The conditional write detects the existing `eventId`, the transaction is cancelled, and the processor logs `DUPLICATE` and acknowledges the message. Counters are unchanged, and nothing is published twice. | ✅ deployed + unit test |
 | **DynamoDB throttling or errors** | SDK retries first; persistent failure fails that message only, and SQS retries it later. Because each write is one atomic transaction, a retry can never leave a half-applied update. Sustained failure lands messages in the DLQ for redrive after recovery. | ✅ unit test |
 | **Processing stalled** (bad deploy, permissions) | Messages accumulate on the queue (4-day retention). The `processing-stalled` alarm fires when the oldest message is over 5 minutes old. | Design |
-| **EventBridge rejects or is unavailable** | The publisher reports the affected stream records as failed; Lambda retries from the first failure (up to 5 times, splitting the batch to isolate a bad record). After that, the batch's location is sent to the publisher-failures queue and its alarm fires; the [runbook](#runbook) republishes the events. | Unit test; not yet deployed |
-| **A site goes silent** | The site monitor marks it `OFFLINE` and emails once; when heartbeats resume it marks it `ONLINE` and emails once more. | Unit test; not yet deployed |
-| **Site alert email fails to send** | The monitor undoes the recorded change and fails the run, so the next run (or Scheduler's retry) sends it. | Unit test; not yet deployed |
-| **A deploy introduces errors** | CodeDeploy is shifting traffic to the new version; the `lambda-errors` or `error-logs` alarm fires and CodeDeploy rolls the alias back to the previous version. | Not yet deployed |
-| **Accidental delete of data** | Tables have point-in-time recovery (35 days) and survive a stack delete; archive objects are versioned (deleted or overwritten objects recoverable for 7 days). | Not yet deployed |
+| **EventBridge rejects or is unavailable** | The publisher reports the affected stream records as failed; Lambda retries from the first failure (up to 5 times, splitting the batch to isolate a bad record). After that, the batch's location is sent to the publisher-failures queue and its alarm fires; the [runbook](#runbook) republishes the events. | Unit test |
+| **A site goes silent** | The site monitor marks it `OFFLINE` and emails once; when heartbeats resume it marks it `ONLINE` and emails once more. | Unit test |
+| **Site alert email fails to send** | The monitor undoes the recorded change and fails the run, so the next run (or Scheduler's retry) sends it. | Unit test |
+| **A deploy introduces errors** | CodeDeploy is shifting traffic to the new version; the `lambda-errors` or `error-logs` alarm fires and CodeDeploy rolls the alias back to the previous version. | Configuration |
+| **Accidental delete of data** | Tables have point-in-time recovery (35 days) and survive a stack delete; archive objects are versioned (deleted or overwritten objects recoverable for 7 days). | Configuration |
 
 ## Idempotency
 
@@ -197,7 +196,7 @@ TransactWriteItems (all-or-nothing)
 
 - The **event record and the counter increment commit atomically.** Writing them separately would open a window where a crash either loses the increment or double-counts on retry.
 - If the `eventId` already exists, DynamoDB cancels the transaction with `ConditionalCheckFailed` on item 0. The processor treats that as success (`DUPLICATE`) so SQS deletes the message instead of retrying it.
-- **Heartbeats take a different path on purpose.** "Move `lastHeartbeat` forward to T" is *naturally* idempotent, so it uses a single conditional update (`lastHeartbeat < :ts`). That also prevents an out-of-order, older heartbeat from moving the value backwards, since standard SQS does not guarantee ordering. T is the server's receipt time *(not yet deployed; previously the controller's timestamp)*, so a controller's wrong clock can't affect liveness. The heartbeat's own record may replace only an earlier copy of itself *(not yet deployed)*: a heartbeat that reuses another event's ID is dropped, so it can never overwrite a wash or payment record, even one from another site.
+- **Heartbeats take a different path on purpose.** "Move `lastHeartbeat` forward to T" is *naturally* idempotent, so it uses a single conditional update (`lastHeartbeat < :ts`). That also prevents an out-of-order, older heartbeat from moving the value backwards, since standard SQS does not guarantee ordering. T is the server's receipt time, so a controller's wrong clock can't affect liveness. The heartbeat's own record may replace only an earlier copy of itself: a heartbeat that reuses another event's ID is dropped, so it can never overwrite a wash or payment record, even one from another site.
 - Money is stored as **integer cents** (`19.99 * 100 === 1998.9999999999998` in JavaScript).
 - The same idea carries through the rest of the system: a duplicate never inserts a new item, so it never produces a stream record and is never published to EventBridge; replaying archived events is safe; and connectivity changes are claimed with conditional writes so they alert once.
 
@@ -205,7 +204,7 @@ Verified in AWS: resending `evt-1001` returned `202`, the processor logged `outc
 
 ## Controller clocks
 
-*(Not yet deployed.)* An event's `timestamp` comes from the controller's clock, which can be wrong: a dead clock battery, never synced, a time zone bug. `receivedAt` is server time. WashOps compares the two (`src/domain/clock.ts`):
+An event's `timestamp` comes from the controller's clock, which can be wrong: a dead clock battery, never synced, a time zone bug. `receivedAt` is server time. WashOps compares the two (`src/domain/clock.ts`):
 
 | Event | Flagged when | Why |
 |---|---|---|
@@ -223,7 +222,7 @@ Heartbeats also keep the site's current clock error on its summary (`controllerC
 
 ## Offline site detection
 
-*(Not yet deployed.)* A site whose network drops sends nothing, so no error ever reaches the API. The **site monitor** Lambda runs every 5 minutes on EventBridge Scheduler and compares each site's `lastHeartbeat` (server receipt time) with the `OfflineAfterMinutes` threshold (default 10).
+A site whose network drops sends nothing, so no error ever reaches the API. The **site monitor** Lambda runs every 5 minutes on EventBridge Scheduler and compares each site's `lastHeartbeat` (server receipt time) with the `OfflineAfterMinutes` threshold (default 10).
 
 1. It reads every site's `locationId`, `lastHeartbeat`, and `connectivity` from the summary table (a `Scan` with a projection; the table holds one small item per site).
 2. Only **changes** alert: `ONLINE → OFFLINE` when a site goes silent, `OFFLINE → ONLINE` when heartbeats resume. A site that is still offline stays quiet.
@@ -236,7 +235,7 @@ The API reports the result: `connectivity` (`ONLINE`, `OFFLINE`, or `UNKNOWN` if
 
 ## Event fan-out with EventBridge
 
-*(Not yet deployed.)* Other systems (maintenance ticketing, loyalty, BI) should be able to react to washes and faults without this service calling them, or even knowing they exist.
+Other systems (maintenance ticketing, loyalty, BI) should be able to react to washes and faults without this service calling them, or even knowing they exist.
 
 - **Publish from the table's stream, not from the processor.** Calling EventBridge right after the DynamoDB transaction would be a *dual write*: if the transaction commits and the publish fails, the retry finds a duplicate and the event is never published. Instead, `EventsTable` has a stream (`NEW_IMAGE`), and the **event publisher** Lambda publishes each newly inserted item. An event is published if and only if it was recorded.
 - **Filter before invoking.** The event source mapping's filter passes only `INSERT` records that aren't heartbeats, so TTL deletions and heartbeats never invoke (or bill) the function.
@@ -254,7 +253,7 @@ A new consumer is just a rule on the bus:
 
 **No credentials exist in code or configuration.** Each Lambda runs as its own **execution role**. The Lambda service assumes the role and injects short-lived credentials that the AWS SDK picks up automatically.
 
-### Who can call the API *(not yet deployed)*
+### Who can call the API
 
 | Caller | How it authenticates | Scopes |
 |---|---|---|
@@ -364,20 +363,20 @@ filter ispresent(outcome) | stats count(*) as events by outcome
 filter message = 'Event rejected' | stats count(*) by reason, statusCode
 ```
 
-**Which site credential sent the most events** *(not yet deployed)*:
+**Which site credential sent the most events**:
 
 ```sql
 filter message = 'Event accepted' | stats count(*) as events by clientId
 ```
 
-**Which controllers have wrong clocks** *(not yet deployed)*, in the processor's log group:
+**Which controllers have wrong clocks**, in the processor's log group:
 
 ```sql
 filter message = 'Controller clock looks wrong'
 | stats count(*) as events, max(clockSkewSeconds) as maxSkew, min(clockSkewSeconds) as minSkew by locationId
 ```
 
-**Credentials used for the wrong site** *(not yet deployed)*:
+**Credentials used for the wrong site**:
 
 ```sql
 filter message = 'Event rejected' and statusCode = 403 | stats count(*) by clientId, locationId
@@ -385,7 +384,7 @@ filter message = 'Event rejected' and statusCode = 403 | stats count(*) by clien
 
 API Gateway access logs (`/aws/vendedlogs/washops/http-api-access`) record `requestId`, `status`, and `integrationStatus`/`integrationError`, which separates "API Gateway problem" from "our code returned an error". The same `apiRequestId` appears in the ingest Lambda's logs.
 
-**Custom metrics from logs** *(not yet deployed)*, namespace `WashOps/<stack>`, with no `PutMetricData` calls:
+**Custom metrics from logs**, namespace `WashOps/<stack>`, with no `PutMetricData` calls:
 
 | Metric | Source |
 |---|---|
@@ -393,7 +392,7 @@ API Gateway access logs (`/aws/vendedlogs/washops/http-api-access`) record `requ
 | `OfflineSites` | Site monitor's "Site check complete" log line (EMF) |
 | `ErrorLogs` | A metric filter on every function's log group counting `level = "error"` lines |
 
-**Tracing** *(not yet deployed)*: every function has X-Ray active tracing, which shows init vs. handler time per invocation. The AWS SDK adds the trace header to its SQS call, so the processor's trace should link back to the ingest request; confirm it in the X-Ray console after deploying. Per-call subsegments (S3, SQS, DynamoDB latency) would need SDK instrumentation; see future improvements.
+**Tracing**: every function has X-Ray active tracing, which shows init vs. handler time per invocation. The AWS SDK adds the trace header to its SQS call, so the processor's trace should link back to the ingest request; confirm it in the X-Ray console after deploying. Per-call subsegments (S3, SQS, DynamoDB latency) would need SDK instrumentation; see future improvements.
 
 **Alarms** (SNS email):
 
@@ -401,20 +400,20 @@ API Gateway access logs (`/aws/vendedlogs/washops/http-api-access`) record `requ
 |---|---|---|
 | `washops-dlq-not-empty` | DLQ visible messages > 0 | Events are failing repeatedly and need investigation |
 | `washops-processing-stalled` | Oldest queue message > 5 min for 5 min | Processor is down, misconfigured, or falling behind |
-| `washops-error-logs` *(not yet deployed)* | Any `error`-level log line | A handled failure: a `500` to a controller, a message left for retry, a publish failure. Also a canary rollback trigger. |
-| `washops-lambda-errors` *(not yet deployed)* | Any function crash or timeout | Lambda's own `Errors` metric, summed across all six functions. Also a canary rollback trigger. |
-| `washops-lambda-throttles` *(not yet deployed)* | Any throttled invocation | A concurrency limit was hit (new accounts can start low) |
-| `washops-api-5xx` *(not yet deployed)* | ≥ 5 server errors in 5 min | The API is failing requests (one 5xx is tolerated; controllers retry) |
-| `washops-publisher-failures` *(not yet deployed)* | Publisher-failures queue not empty | Events were recorded but not published to EventBridge |
-| `washops-controller-clock-skew` *(not yet deployed)* | Any event flagged for a wrong clock in 5 min | A controller's clock needs fixing; its events are accepted but flagged |
+| `washops-error-logs` | Any `error`-level log line | A handled failure: a `500` to a controller, a message left for retry, a publish failure. Also a canary rollback trigger. |
+| `washops-lambda-errors` | Any function crash or timeout | Lambda's own `Errors` metric, summed across all six functions. Also a canary rollback trigger. |
+| `washops-lambda-throttles` | Any throttled invocation | A concurrency limit was hit (new accounts can start low) |
+| `washops-api-5xx` | ≥ 5 server errors in 5 min | The API is failing requests (one 5xx is tolerated; controllers retry) |
+| `washops-publisher-failures` | Publisher-failures queue not empty | Events were recorded but not published to EventBridge |
+| `washops-controller-clock-skew` | Any event flagged for a wrong clock in 5 min | A controller's clock needs fixing; its events are accepted but flagged |
 
 In the dev stack the alarm names start with `washops-dev-`.
 
-**Dashboard** *(not yet deployed)*: the `washops` CloudWatch dashboard (stack output `OperationsDashboardUrl`) shows alarm status, API requests/errors/latency, events processed vs. duplicates, queue depth and age, offline sites, failures, Lambda p99 duration, fault alerts, and the stream publisher's lag.
+**Dashboard**: the `washops` CloudWatch dashboard (stack output `OperationsDashboardUrl`) shows alarm status, API requests/errors/latency, events processed vs. duplicates, queue depth and age, offline sites, failures, Lambda p99 duration, fault alerts, and the stream publisher's lag.
 
 ## Querying the archive with Athena
 
-*(Not yet deployed.)* The raw archive is queryable with SQL in place. The stack creates a Glue database (`washops_archive`), a `raw_events` table, an Athena workgroup (`washops-archive`) with a 1 GB per-query scan limit, and three saved queries:
+The raw archive is queryable with SQL in place. The stack creates a Glue database (`washops_archive`), a `raw_events` table, an Athena workgroup (`washops-archive`) with a 1 GB per-query scan limit, and three saved queries:
 
 - **Daily revenue by site** (last 7 days)
 - **Equipment faults by code** (last 30 days)
@@ -433,7 +432,7 @@ The archive keeps every receipt, so a controller retry appears as a repeated `ev
 
 ## Operations dashboard
 
-*(Not yet deployed.)* A static web page (`dashboard/`, plain HTML/CSS/JS, no build step) served from a private S3 bucket through CloudFront:
+A static web page (`dashboard/`, plain HTML/CSS/JS, no build step) served from a private S3 bucket through CloudFront:
 
 - KPI tiles: sites, offline now, completed washes, wash revenue, equipment faults
 - every site with its connectivity (icon + label), totals, and last heartbeat
@@ -454,7 +453,7 @@ People sign in on Cognito's hosted page; the page then calls the API's `GET` rou
    aws sqs start-message-move-task --source-arn <DeadLetterQueueArn>
    ```
 
-**Events were accepted but never processed** (purged from the DLQ, or older than the queue's 4-day retention after a long outage) *(not yet deployed)*. Requeue one day of the archive, optionally one site, with the replay function. Start with a dry run:
+**Events were accepted but never processed** (purged from the DLQ, or older than the queue's 4-day retention after a long outage). Requeue one day of the archive, optionally one site, with the replay function. Start with a dry run:
 
 ```bash
 aws lambda invoke --function-name washops-replay --cli-binary-format raw-in-base64-out \
@@ -463,7 +462,7 @@ aws lambda invoke --function-name washops-replay --cli-binary-format raw-in-base
 
 Then repeat without `dryRun`. Events that were already processed are skipped as duplicates, so over-selecting is harmless. The result reports how many objects were found, requeued, skipped as repeat receipts, or invalid under the current schema.
 
-**Events were recorded but not published** (`washops-publisher-failures`) *(not yet deployed)*. Find the affected event IDs in the publisher's logs:
+**Events were recorded but not published** (`washops-publisher-failures`). Find the affected event IDs in the publisher's logs:
 
 ```sql
 filter service = 'washops-event-publisher' and level = 'error' | fields eventId, eventIds, message
@@ -535,7 +534,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Replay | Requeue once per event with original correlation ID; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
 | Money | Floating-point conversion to integer cents |
 
-### Integration tests *(not yet run against AWS)*
+### Integration tests
 
 `tests/integration/` calls a deployed stack over HTTP: real API Gateway, Cognito, Lambda, SQS, and DynamoDB. The tests read the stack's outputs and the demo site's client secret with the AWS CLI, get a token, and work out which site the credential is bound to from its scopes.
 
@@ -555,13 +554,13 @@ npm run test:integration                          # washops-dev
 WASHOPS_STACK=other-stack npm run test:integration
 ```
 
-They write real data, so they run against dev, never prod. CI runs them after every dev deploy and only promotes to prod if they pass. The suite was exercised against a local mock of the API (which caught one bug in the test itself), but not yet against AWS.
+They write real data, so they run against dev, never prod. CI runs them after every dev deploy and only promotes to prod if they pass.
 
 End-to-end behavior of the core pipeline was verified by hand against the deployed stack (see [API reference and examples](#api-reference-and-examples)).
 
 ## Environments
 
-*(Not yet deployed.)* One template, two stacks. Every resource name includes the stack name, so both live side by side in one account:
+One template, two stacks. Every resource name includes the stack name, so both live side by side in one account:
 
 | | dev (`washops-dev`) | prod (`washops`) |
 |---|---|---|
@@ -578,6 +577,22 @@ Each stack has its own Cognito user pool, credentials, tables, queues, bus, dash
 `DeletionPolicy` comes from a parameter, which CloudFormation only allows with the `AWS::LanguageExtensions` transform, so the template lists it before the SAM transform.
 
 The production-grade version of this is separate AWS accounts per environment (AWS Organizations), so a mistake in dev can't even see prod. The pipeline already supports that: deploy `deploy/github-deploy-role.yaml` in each account and give each deploy job its own role.
+
+## Deployment status
+
+The core pipeline is deployed and was verified in AWS by hand. Everything since is implemented and checked on every push by CI (typecheck, lint, unit tests, `sam validate --lint`, `sam build`), and goes live with the next deploy, when the [integration tests](#integration-tests) first run against it.
+
+| Area | Status |
+|---|---|
+| Ingest API, S3 archive, SQS with DLQ, idempotent processor, DynamoDB, query API, `dlq-not-empty` and `processing-stalled` alarms | **Deployed.** Duplicate delivery and a poison message (retries → DLQ → alarm) verified in AWS |
+| Cognito authentication and per-site credentials | Unit + integration tests; awaiting deployment |
+| Controller clock checks; heartbeat liveness in server time | Unit + integration tests; awaiting deployment |
+| Offline-site detection and site alerts | Unit tests; awaiting deployment |
+| EventBridge fan-out, fault alerts, replay tool | Unit tests; awaiting deployment |
+| Operations web dashboard | Tested in a browser against a mocked API; awaiting deployment |
+| Extra alarms, CloudWatch dashboard, EMF metrics, X-Ray, Athena | Defined in `template.yaml`; awaiting deployment |
+| Canary deploys with rollback, point-in-time recovery, versioned archive, `maxReceiveCount` 5 | Defined in `template.yaml`; awaiting deployment |
+| dev and prod stacks, GitHub OIDC deploy jobs | Defined; the deploy jobs switch on once the deploy role is set up |
 
 ## AWS deployment
 
@@ -657,9 +672,9 @@ In prod, `sam delete` leaves the two DynamoDB tables and the raw events bucket i
 |---|---|
 | **verify** | `npm ci` → typecheck → lint → unit tests → esbuild bundle |
 | **sam** | install SAM CLI → `sam validate --lint` (cfn-lint) → `sam build` → upload the build as an artifact |
-| **deploy-dev** *(main only, once set up; not yet run)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
-| **integration-tests** *(not yet run)* | `npm run test:integration` against `washops-dev` |
-| **deploy-prod** *(not yet run)* | the **same build** → `sam deploy --config-env ci-prod`; waits for the canary |
+| **deploy-dev** *(main only, once set up)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
+| **integration-tests** | `npm run test:integration` against `washops-dev` |
+| **deploy-prod** | the **same build** → `sam deploy --config-env ci-prod`; waits for the canary |
 
 **Build once, promote.** The `sam` job builds the Lambda bundles once; dev and prod deploy that exact artifact, so prod runs precisely the code that passed the integration tests. A failure at any step stops the pipeline before prod.
 
@@ -687,7 +702,7 @@ The AWS jobs are skipped until `AWS_DEPLOY_ROLE_ARN` exists, so CI keeps working
 
 ## API reference and examples
 
-Responses below were captured from the deployed stack before authentication was added; the bodies are unchanged. The base URL is the `ApiBaseUrl` stack output. Every request now needs `Authorization: Bearer <access token>` *(not yet deployed)*; get one from the `TokenUrl` output:
+Responses below were captured from the deployed stack before authentication was added; the bodies are unchanged. The base URL is the `ApiBaseUrl` stack output. Every request now needs `Authorization: Bearer <access token>`; get one from the `TokenUrl` output:
 
 ```bash
 TOKEN=$(curl -s -u "$WASHOPS_CLIENT_ID:$WASHOPS_CLIENT_SECRET" "$WASHOPS_TOKEN_URL" \
@@ -754,14 +769,14 @@ HTTP 400
 
 **No token:** `HTTP 401 {"message":"Unauthorized"}`, returned by API Gateway; no Lambda runs.
 
-**Credential bound to another site** *(not yet deployed)*:
+**Credential bound to another site**:
 
 ```json
 HTTP 403
 { "message": "This credential may not send events for location tampa-02", "correlationId": "..." }
 ```
 
-**Wrong controller clock** *(not yet deployed)*: still accepted.
+**Wrong controller clock**: still accepted.
 
 ```json
 HTTP 202
@@ -790,11 +805,11 @@ HTTP 200
 }
 ```
 
-This was captured after sending three `WASH_COMPLETED` requests, one of which was a duplicate `eventId`, so `completedWashes` is 2. Summaries now also include `connectivity` (`ONLINE` / `OFFLINE` / `UNKNOWN`), `connectivityChangedAt`, and `controllerClockSkewSeconds` *(not yet deployed)*; `lastHeartbeat` becomes server receipt time.
+This was captured after sending three `WASH_COMPLETED` requests, one of which was a duplicate `eventId`, so `completedWashes` is 2. Summaries now also include `connectivity` (`ONLINE` / `OFFLINE` / `UNKNOWN`), `connectivityChangedAt`, and `controllerClockSkewSeconds`, which this capture predates; `lastHeartbeat` is the server's receipt time.
 
 ### `GET /locations`
 
-*(Not yet deployed.)* Every location's summary, sorted by `locationId`: `{ "count": 2, "locations": [ { ...summary }, ... ] }`.
+Every location's summary, sorted by `locationId`: `{ "count": 2, "locations": [ { ...summary }, ... ] }`.
 
 ### `GET /events/{eventId}`
 
