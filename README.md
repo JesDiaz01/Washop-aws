@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 8 integration tests passing against the live stack and 66 unit tests in CI. [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack and 71 unit tests in CI. [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -266,6 +266,7 @@ A new consumer is just a rule on the bus:
 
 - API Gateway's **JWT authorizer** checks the signature against Cognito's published keys, the expiry, the issuer, that the token came from an allowed app client, and the route's scope: `POST /events` needs `events.write`; every `GET` needs `events.read`. Invalid requests get `401`/`403` without invoking a Lambda.
 - **Each credential is bound to its site.** A site's app client is granted a scope naming its location (`washops/site.miami-01`), so the verified token itself says which site it may send for. Ingest compares that with the event's `locationId` and returns `403` on a mismatch, before anything is archived or queued. Without this, any one site's credential could post events, and revenue, for every other site. Because the answer is in the token, there's no lookup on the request path.
+- **Reads are bound the same way.** A site's credential reads only its own site: `GET /locations` lists just that site, another site's summary or activity returns `403`, and another site's event returns the same `404` as a missing one, so IDs can't be probed. Dashboard users see every site. The query Lambda tells them apart by the token's app client (`client_id`), not by its scopes, because a client-credentials request may ask for fewer scopes: a site token requested without its site scope reads nothing rather than everything.
 - The ingest Lambda records the caller's `client_id` in its logs and in the S3 archive record, so every event is attributable to a site credential.
 - One app client per site means one site's credential can be rotated or revoked without touching the others.
 - **Adding a site** is a template change in three places: a `site.<locationId>` scope on the resource server, an app client granted it, and the client's ID in the authorizer's audience list. A Cognito resource server allows 100 custom scopes, so this design fits up to roughly 98 sites; past that, see [future improvements](#future-production-improvements).
@@ -524,7 +525,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 66 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 71 tests across 7 files.
 
 | Area | What is tested |
 |---|---|
@@ -532,7 +533,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON; S3 failure returns `500` and does not enqueue |
 | Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
 | Clocks and site access | Backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
-| Query | Cents → dollars mapping; connectivity in summaries; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation |
+| Query | Cents → dollars mapping; connectivity in summaries; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
 | Replay | Requeue once per event with original correlation ID; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
@@ -551,7 +552,8 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Same event twice → `completedWashes` goes up by exactly 1 | Idempotency in DynamoDB |
 | Timestamp 2 h ahead → `202` with a warning, stored with `clockSkewSeconds` | Clock flagging |
 | Heartbeat 1 h behind → site still alive, clock error recorded; then a correct heartbeat clears it | Liveness in server time |
-| `GET /locations` lists the site | The read path |
+| `GET /locations` lists only the credential's own site | The read path, scoped to the site |
+| Another site's summary → `403` | Read binding |
 
 ```bash
 npm run test:integration                          # washops-dev
@@ -588,8 +590,8 @@ Both stacks run the current release in one AWS account (us-east-1, on the AWS fr
 
 | Area | Verified in AWS |
 |---|---|
-| Ingest → S3 archive + SQS → idempotent processor → DynamoDB → query API | ✅ All 8 [integration tests](#integration-tests) pass against the live stack; duplicate delivery counted once; poison message → DLQ → alarm |
-| Cognito authentication and per-site credentials | ✅ `401` without a token (no Lambda runs), `403` for another site's events, tokens from the client-credentials flow |
+| Ingest → S3 archive + SQS → idempotent processor → DynamoDB → query API | ✅ All 9 [integration tests](#integration-tests) pass against the live stack; duplicate delivery counted once; poison message → DLQ → alarm |
+| Cognito authentication and per-site credentials | ✅ `401` without a token (no Lambda runs); a site credential gets `403` for another site's events and data, and sees only its own site; tokens from the client-credentials flow |
 | Controller clock checks | ✅ `202` with a warning for a clock 2 h ahead, stored with `clockSkewSeconds`; the `controller-clock-skew` alarm fired |
 | EventBridge fan-out and fault alerts | ✅ Every new event published (0 failures); the HIGH-severity rule matched and delivered to SNS |
 | Offline-site detection | ✅ A silent site was marked `OFFLINE` 11 minutes after its last heartbeat and alerted once; the next heartbeat brought it back `ONLINE` with one recovery alert |
@@ -735,6 +737,8 @@ x-correlation-id: demo-trace-0001
 
 {"message":"Event accepted","eventId":"evt-1001","correlationId":"demo-trace-0001"}
 ```
+
+The files in `events/` have fixed timestamps (2026-09-14), so sent today they are accepted with a `warnings` entry: more than 7 days old reads as a wrong controller clock (see [Controller clocks](#controller-clocks)). `scripts/send-sample-events.mjs` builds its events with current timestamps.
 
 Supported `eventType` values and their `data`:
 

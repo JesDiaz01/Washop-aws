@@ -132,12 +132,17 @@ describe(`deployed API (${process.env.WASHOPS_STACK ?? 'washops-dev'})`, () => {
     });
   });
 
-  it('lists the site in GET /locations', async () => {
+  it('lists only its own site in GET /locations', async () => {
     const response = await get('/locations');
 
     expect(response.status).toBe(200);
-    expect(response.body.locations).toEqual(
-      expect.arrayContaining([expect.objectContaining({ locationId: site.locationId })]),
-    );
+    const listed = (response.body.locations as { locationId: string }[]).map((l) => l.locationId);
+    expect(listed).toEqual([site.locationId]);
+  });
+
+  it("refuses to read another site's data with a site credential", async () => {
+    const response = await get('/locations/other-site-01/summary');
+
+    expect(response.status).toBe(403);
   });
 });

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { describeSkew, isClockSuspect } from '../src/domain/clock';
 import { connectivityChangeFor } from '../src/domain/connectivity';
 import { toValidationIssues, washEventSchema } from '../src/domain/events';
-import { canSendFor } from '../src/domain/siteAccess';
+import { boundSites, canSendFor } from '../src/domain/siteAccess';
 import { counterIncrementsFor, toCents } from '../src/domain/summary';
 import { heartbeatPayload, washCompletedPayload } from './fixtures';
 
@@ -129,5 +129,12 @@ describe('canSendFor', () => {
     expect(canSendFor(scopes, 'miami-01')).toBe(true);
     expect(canSendFor(scopes, 'tampa-02')).toBe(false);
     expect(canSendFor(scopes, 'miami-0')).toBe(false); // no prefix tricks
+  });
+});
+
+describe('boundSites', () => {
+  it('lists the locations named by site scopes and ignores other scopes', () => {
+    expect(boundSites(['washops/events.read', 'washops/site.miami-01', 'openid'])).toEqual(['miami-01']);
+    expect(boundSites(['washops/events.read'])).toEqual([]);
   });
 });

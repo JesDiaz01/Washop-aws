@@ -740,6 +740,7 @@ Resources:
         Variables:
           EVENTS_TABLE: !Ref EventsTable
           SUMMARY_TABLE: !Ref LocationSummaryTable
+          DASHBOARD_CLIENT_ID: !Ref DashboardClient # its users read every site; site credentials only their own
       Events:
         ListLocations:
           Type: HttpApi

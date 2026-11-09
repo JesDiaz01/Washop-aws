@@ -14,6 +14,7 @@ export default defineConfig({
       SITE_ALERTS_TOPIC_ARN: 'arn:aws:sns:us-east-1:123456789012:test-site-alerts',
       OFFLINE_AFTER_MINUTES: '10',
       EVENT_BUS_NAME: 'test-event-bus',
+      DASHBOARD_CLIENT_ID: 'test-dashboard-client',
     },
   },
 });

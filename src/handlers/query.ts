@@ -8,8 +8,10 @@ import {
   toPublicEvent,
 } from '../aws/eventStore';
 import { eventIdSchema, locationIdSchema } from '../domain/events';
-import { BadRequestError, HttpError, NotFoundError } from '../shared/errors';
-import { callerClientId, jsonResponse } from '../shared/http';
+import { boundSites } from '../domain/siteAccess';
+import { requireEnv } from '../shared/config';
+import { BadRequestError, ForbiddenError, HttpError, NotFoundError } from '../shared/errors';
+import { callerClientId, callerScopes, jsonResponse } from '../shared/http';
 import { createLogger, serializeError } from '../shared/logger';
 
 /**
@@ -43,6 +45,25 @@ function parseLimit(raw: string | undefined): number {
   return limit;
 }
 
+/**
+ * Which sites the caller may read. People signed in to the dashboard see every site; any other
+ * credential (a site controller's) sees only the sites its washops/site.* scopes name, so one site
+ * can't read another's revenue. The app client decides, not the scopes: a site client can request a
+ * token without its site scope, and that must narrow its access, never widen it.
+ */
+type ReadableSites = 'ALL' | ReadonlySet<string>;
+
+function readableSites(event: APIGatewayProxyEventV2WithJWTAuthorizer): ReadableSites {
+  if (callerClientId(event) === requireEnv('DASHBOARD_CLIENT_ID')) return 'ALL';
+  return new Set(boundSites(callerScopes(event)));
+}
+
+const canRead = (sites: ReadableSites, locationId: string) => sites === 'ALL' || sites.has(locationId);
+
+function requireReadable(sites: ReadableSites, locationId: string): void {
+  if (!canRead(sites, locationId)) throw new ForbiddenError(`This credential may not read location ${locationId}`);
+}
+
 const centsToDollars = (cents: number | undefined) => (cents ?? 0) / 100;
 
 export function toSummaryResponse(item: LocationSummaryItem) {
@@ -65,9 +86,12 @@ export function toSummaryResponse(item: LocationSummaryItem) {
 }
 
 async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyStructuredResultV2> {
+  const sites = readableSites(event);
+
   switch (event.routeKey) {
     case 'GET /locations': {
       const locations = (await listLocationSummaries())
+        .filter((summary) => canRead(sites, summary.locationId))
         .map(toSummaryResponse)
         .sort((a, b) => a.locationId.localeCompare(b.locationId));
       return jsonResponse(200, { count: locations.length, locations });
@@ -75,6 +99,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
 
     case 'GET /locations/{locationId}/summary': {
       const locationId = pathParam(event, 'locationId', locationIdSchema);
+      requireReadable(sites, locationId);
       const summary = await getLocationSummary(locationId);
       if (!summary) throw new NotFoundError(`No summary found for location ${locationId}`);
       return jsonResponse(200, toSummaryResponse(summary));
@@ -82,6 +107,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
 
     case 'GET /locations/{locationId}/events': {
       const locationId = pathParam(event, 'locationId', locationIdSchema);
+      requireReadable(sites, locationId);
       const limit = parseLimit(event.queryStringParameters?.limit);
       const items = await listRecentEvents(locationId, limit);
       return jsonResponse(200, { locationId, count: items.length, events: items.map(toPublicEvent) });
@@ -90,8 +116,11 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
     case 'GET /events/{eventId}': {
       const eventId = pathParam(event, 'eventId', eventIdSchema);
       const item = await getEvent(eventId);
-      // 404 can also mean "accepted but still in the queue": processing is asynchronous.
-      if (!item) throw new NotFoundError(`Event ${eventId} not found (it may not be processed yet)`);
+      // 404 can also mean "accepted but still in the queue": processing is asynchronous. Another
+      // site's event gets the same answer, so a site credential can't probe which IDs exist.
+      if (!item || !canRead(sites, item.locationId)) {
+        throw new NotFoundError(`Event ${eventId} not found (it may not be processed yet)`);
+      }
       return jsonResponse(200, toPublicEvent(item));
     }
 
