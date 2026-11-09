@@ -675,7 +675,11 @@ Resources:
             BatchSize: 10
             FunctionResponseTypes: [ReportBatchItemFailures] # retry only failed messages, not the whole batch
             ScalingConfig:
-              MaximumConcurrency: 5 # cap parallel consumers: backpressure for downstream systems
+              # Cap parallel consumers (2 is the minimum). Sized from the load test: the API's throttle
+              # (25 req/s) is the real cap on inflow, and one consumer processes over 100 events/s, so 2
+              # keeps up while leaving the account's Lambda concurrency (10 on new accounts) to the API,
+              # and fewer concurrent transactions on a busy site's summary item conflict less.
+              MaximumConcurrency: 2
 
   ProcessorLogGroup:
     Type: AWS::Logs::LogGroup

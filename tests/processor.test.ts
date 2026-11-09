@@ -56,6 +56,36 @@ describe('processor handler (SQS consumer)', () => {
     expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(1);
   });
 
+  it('retries a transaction conflict on the summary item right away instead of waiting for SQS', async () => {
+    // What DynamoDB returns when another transaction was updating the same location summary.
+    const conflict = new TransactionCanceledException({
+      message: 'Transaction cancelled',
+      $metadata: {},
+      CancellationReasons: [{ Code: 'None' }, { Code: 'TransactionConflict' }],
+    });
+    ddbMock.on(TransactWriteCommand).rejectsOnce(conflict).resolves({});
+
+    const result = await handler(sqsEvent([messageFor(washCompletedPayload())]), lambdaContext);
+
+    expect(result.batchItemFailures).toEqual([]);
+    expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(2);
+  });
+
+  it('gives a persistently conflicting message back to SQS after a few attempts', async () => {
+    ddbMock.on(TransactWriteCommand).rejects(
+      new TransactionCanceledException({
+        message: 'Transaction cancelled',
+        $metadata: {},
+        CancellationReasons: [{ Code: 'None' }, { Code: 'TransactionConflict' }],
+      }),
+    );
+
+    const result = await handler(sqsEvent([messageFor(washCompletedPayload(), 'msg-hot')]), lambdaContext);
+
+    expect(result.batchItemFailures).toEqual([{ itemIdentifier: 'msg-hot' }]);
+    expect(ddbMock.commandCalls(TransactWriteCommand)).toHaveLength(4);
+  });
+
   it('reports only the failed message when DynamoDB throws (e.g. throttling)', async () => {
     ddbMock
       .on(TransactWriteCommand)

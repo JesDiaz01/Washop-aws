@@ -28,6 +28,18 @@ const DAY_SECONDS = 24 * 60 * 60;
 const EVENT_TTL_DAYS = 90;
 const HEARTBEAT_TTL_DAYS = 7;
 
+/**
+ * Concurrent transactions on the same location summary make DynamoDB cancel all but one with
+ * TransactionConflict (seen in the load test). A cancelled transaction wrote nothing, so retrying
+ * at once is safe; otherwise the message would wait out the 60 s visibility timeout.
+ */
+const MAX_TRANSACTION_ATTEMPTS = 4;
+const conflictBackoffMs = (attempt: number) => 20 * 2 ** (attempt - 1) + Math.random() * 20;
+
+function cancellationCodes(error: unknown): (string | undefined)[] {
+  return error instanceof TransactionCanceledException ? (error.CancellationReasons ?? []).map((reason) => reason.Code) : [];
+}
+
 export type RecordOutcome = 'PROCESSED' | 'DUPLICATE' | 'STALE_HEARTBEAT';
 
 export interface EventItem {
@@ -119,42 +131,44 @@ export async function recordEvent(envelope: QueueEnvelope, now = new Date()): Pr
     return `#c${i} :c${i}`;
   });
 
-  try {
-    // Both writes commit together or not at all.
-    await getDynamoClient().send(
-      new TransactWriteCommand({
-        TransactItems: [
-          {
-            // 1) Idempotency: fails if this eventId was already processed.
-            Put: {
-              TableName: eventsTable(),
-              Item: item,
-              ConditionExpression: 'attribute_not_exists(eventId)',
-            },
-          },
-          {
-            // 2) Side effect: ADD is atomic and creates the summary item/counters if missing.
-            Update: {
-              TableName: summaryTable(),
-              Key: { locationId: item.locationId },
-              UpdateExpression: `ADD ${addClauses.join(', ')} SET #lastUpdated = :now`,
-              ExpressionAttributeNames: names,
-              ExpressionAttributeValues: values,
-            },
-          },
-        ],
-      }),
-    );
-    return 'PROCESSED';
-  } catch (error) {
-    // CancellationReasons is ordered like TransactItems; index 0 is the idempotency Put.
-    if (
-      error instanceof TransactionCanceledException &&
-      error.CancellationReasons?.[0]?.Code === 'ConditionalCheckFailed'
-    ) {
-      return 'DUPLICATE';
+  // Both writes commit together or not at all. A fresh command per attempt keeps retries independent.
+  const transaction = () => new TransactWriteCommand({
+    TransactItems: [
+      {
+        // 1) Idempotency: fails if this eventId was already processed.
+        Put: {
+          TableName: eventsTable(),
+          Item: item,
+          ConditionExpression: 'attribute_not_exists(eventId)',
+        },
+      },
+      {
+        // 2) Side effect: ADD is atomic and creates the summary item/counters if missing.
+        Update: {
+          TableName: summaryTable(),
+          Key: { locationId: item.locationId },
+          UpdateExpression: `ADD ${addClauses.join(', ')} SET #lastUpdated = :now`,
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        },
+      },
+    ],
+  });
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await getDynamoClient().send(transaction());
+      return 'PROCESSED';
+    } catch (error) {
+      const codes = cancellationCodes(error);
+      // CancellationReasons is ordered like TransactItems; index 0 is the idempotency Put.
+      if (codes[0] === 'ConditionalCheckFailed') return 'DUPLICATE';
+      if (codes.includes('TransactionConflict') && attempt < MAX_TRANSACTION_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, conflictBackoffMs(attempt)));
+        continue;
+      }
+      throw error; // throttling, service errors, persistent conflicts -> message is retried by SQS
     }
-    throw error; // throttling, service errors -> message is retried by SQS
   }
 }
 
