@@ -1,5 +1,7 @@
-# Monthly dependency updates, grouped into one pull request per ecosystem. CI runs the unit tests
-# and the SAM build on each one; merging to main then goes through the normal pipeline.
+# Monthly dependency updates. Minor and patch versions arrive grouped, one pull request per
+# ecosystem; each major version gets its own pull request, so one incompatible major can't hold back
+# the rest. CI runs the unit tests and the SAM build on each one; merging to main then goes through
+# the normal pipeline.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -9,7 +11,17 @@ updates:
     groups:
       npm:
         patterns: ['*']
-    open-pull-requests-limit: 2
+        update-types: [minor, patch]
+    ignore:
+      # The Node types follow the Lambda runtime (Node 22, see .nvmrc), which is upgraded on purpose:
+      # newer types would let code use APIs the runtime doesn't have.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+      # typescript-eslint supports a fixed TypeScript range, so a TypeScript major waits until it
+      # catches up; the two are upgraded together.
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+    open-pull-requests-limit: 3
 
   - package-ecosystem: github-actions
     directory: /
