@@ -43,6 +43,23 @@ export function connectivityChangeFor(
   return undefined;
 }
 
+/**
+ * Connectivity as the API reports it: the site monitor's verdict, except that a heartbeat received
+ * after a site was marked offline proves it's back now. The monitor records that change, and sends
+ * the recovery alert, on its next run, up to 5 minutes later. Both timestamps are server time in
+ * ISO-8601 UTC, so they compare as strings.
+ */
+export function reportedConnectivity(site: {
+  lastHeartbeat?: string;
+  connectivity?: Connectivity;
+  connectivityChangedAt?: string;
+}): Connectivity | 'UNKNOWN' {
+  if (!site.lastHeartbeat) return site.connectivity ?? 'UNKNOWN';
+  const heardFromSinceMarkedOffline =
+    site.connectivity === 'OFFLINE' && site.connectivityChangedAt !== undefined && site.lastHeartbeat > site.connectivityChangedAt;
+  return heardFromSinceMarkedOffline ? 'ONLINE' : (site.connectivity ?? 'ONLINE');
+}
+
 export function siteAlertFor(site: ReportingSite, to: Connectivity, now: Date, offlineAfterMinutes: number): SiteAlert {
   if (to === 'OFFLINE') {
     return {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { describeSkew, isClockSuspect } from '../src/domain/clock';
-import { connectivityChangeFor } from '../src/domain/connectivity';
+import { connectivityChangeFor, reportedConnectivity } from '../src/domain/connectivity';
 import { toValidationIssues, washEventSchema } from '../src/domain/events';
 import { boundSites, canSendFor } from '../src/domain/siteAccess';
 import { counterIncrementsFor, toCents } from '../src/domain/summary';
@@ -95,6 +95,32 @@ describe('connectivityChangeFor', () => {
     ['never sent a heartbeat', site(undefined), undefined],
   ])('%s', (_label, input, expected) => {
     expect(connectivityChangeFor(input, now, 10)).toBe(expected);
+  });
+});
+
+describe('reportedConnectivity', () => {
+  const markedOfflineAt = '2026-09-14T12:00:03.000Z';
+
+  it.each([
+    ['never sent a heartbeat', {}, 'UNKNOWN'],
+    ['heartbeating, never marked offline', { lastHeartbeat: '2026-09-14T11:59:00.000Z' }, 'ONLINE'],
+    [
+      'marked offline, nothing since',
+      { lastHeartbeat: '2026-09-14T11:49:00.000Z', connectivity: 'OFFLINE', connectivityChangedAt: markedOfflineAt },
+      'OFFLINE',
+    ],
+    [
+      'heartbeat after being marked offline: back before the next check',
+      { lastHeartbeat: '2026-09-14T12:01:30.000Z', connectivity: 'OFFLINE', connectivityChangedAt: markedOfflineAt },
+      'ONLINE',
+    ],
+    [
+      'marked back online by the monitor',
+      { lastHeartbeat: '2026-09-14T12:01:30.000Z', connectivity: 'ONLINE', connectivityChangedAt: '2026-09-14T12:05:03.000Z' },
+      'ONLINE',
+    ],
+  ] as const)('%s', (_label, site, expected) => {
+    expect(reportedConnectivity(site)).toBe(expected);
   });
 });
 

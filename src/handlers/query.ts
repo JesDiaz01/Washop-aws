@@ -7,6 +7,7 @@ import {
   type LocationSummaryItem,
   toPublicEvent,
 } from '../aws/eventStore';
+import { reportedConnectivity } from '../domain/connectivity';
 import { eventIdSchema, locationIdSchema } from '../domain/events';
 import { boundSites } from '../domain/siteAccess';
 import { requireEnv } from '../shared/config';
@@ -78,8 +79,9 @@ export function toSummaryResponse(item: LocationSummaryItem) {
     lastHeartbeat: item.lastHeartbeat ?? null,
     // From the latest heartbeat: how far the controller's clock is off (positive = ahead).
     controllerClockSkewSeconds: item.controllerClockSkewSeconds ?? null,
-    // As of the site monitor's last check (every 5 minutes). UNKNOWN: no heartbeat ever received.
-    connectivity: item.connectivity ?? (item.lastHeartbeat ? 'ONLINE' : 'UNKNOWN'),
+    // The site monitor's verdict, or ONLINE as soon as a heartbeat follows an OFFLINE mark.
+    // UNKNOWN: no heartbeat ever received.
+    connectivity: reportedConnectivity(item),
     connectivityChangedAt: item.connectivityChangedAt ?? null,
     lastUpdated: item.lastUpdated ?? null,
   };
