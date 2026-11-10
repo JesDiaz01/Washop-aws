@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 78 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 82 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -19,7 +19,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
 - **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
 - **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
-- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 78 unit tests and 9 integration tests against the live stack.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 82 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -475,7 +475,10 @@ aws lambda invoke --function-name washops-replay --cli-binary-format raw-in-base
   --payload '{"action":"requeue","date":"2026-09-14","locationId":"miami-01","dryRun":true}' out.json && cat out.json
 ```
 
-Then repeat without `dryRun`. Events that were already processed are skipped as duplicates, so over-selecting is harmless. The result reports how many objects were found, requeued, skipped as repeat receipts, or invalid under the current schema.
+Then repeat without `dryRun`. Events that were already processed are skipped as duplicates, so over-selecting is harmless. The result reports how many objects were found, requeued, skipped as repeat receipts, invalid under the current schema, or refused by SQS (`failed`; rerun to retry them).
+
+- **Large days:** a run stops about 20 s before the function's 5-minute limit and returns `"complete": false` with `resumeAfter`; pass that value back as `"startAfter"` to continue. At about 15 ms per object (2,190 objects in 33 s on dev), one run covers roughly 18,000.
+- **Old days are refused.** The duplicate check is each event's record in DynamoDB, which expires after 90 days, so the tool only requeues the last 89 days. The same applies to records deleted by hand: an event whose record is gone is processed again, so to reset a stack's data, empty the archive as well (or recreate the stack).
 
 **Events were recorded but not published** (`washops-publisher-failures`). Find the affected event IDs in the publisher's logs:
 
@@ -535,7 +538,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 78 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 82 tests across 7 files.
 
 | Area | What is tested |
 |---|---|
@@ -546,7 +549,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
-| Replay | Requeue once per event with original correlation ID; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
+| Replay | Requeue once per event with original correlation ID; SQS batches of 10, refused entries resent and reported; stops before the time limit with a resume key; days outside the duplicate window refused; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
 | Money | Floating-point conversion to integer cents |
 
 ### Integration tests
@@ -580,21 +583,22 @@ They write real data, so they run against dev, never prod. CI runs them after ev
 node scripts/load-test.mjs washops-dev --events 1000 --rate 20 --duplicates 0.05
 ```
 
-Run on 2026-11-09 against `washops-dev`: 1,000 `WASH_COMPLETED` events plus 50 duplicate deliveries at 20 requests/s, sent from a home connection (latency includes the round trip to us-east-1).
+Each run: 1,000 `WASH_COMPLETED` events plus 50 duplicate deliveries at 20 requests/s against `washops-dev`, sent from a home connection (latency includes the round trip to us-east-1).
 
-| | First run | After the fixes below |
-|---|---|---|
-| Counted | 1,000 of 1,000; revenue exactly $10,000 | same |
-| Dead-letter queue | 0 | 0 |
-| API latency p50 / p95 / p99 | 86 / 159 / 760 ms | 85 / 158 / 300 ms |
-| Processing, API receipt → DynamoDB, p50 / p95 / max | 76 ms / 176 ms / 60 s | 88 ms / 365 ms / 784 ms |
-| Queue drained after the last request | 78.6 s | 0.24 s |
-| `503`s from API Gateway (retried; none lost) | 43 | 6 |
+| | First run (2026-11-09) | After the fixes below | Concurrency quota raised (2026-11-10) |
+|---|---|---|---|
+| Counted | 1,000 of 1,000; revenue exactly $10,000 | same | same |
+| Dead-letter queue | 0 | 0 | 0 |
+| API latency p50 / p95 / p99 | 86 / 159 / 760 ms | 85 / 158 / 300 ms | 86 / 177 / 1,576 ms |
+| Processing, API receipt → DynamoDB, p50 / p95 / max | 76 ms / 176 ms / 60 s | 88 ms / 365 ms / 784 ms | 75 ms / 128 ms / 159 ms |
+| Queue drained after the last request | 78.6 s | 0.24 s | 0.31 s |
+| `503`s from API Gateway (retried; none lost) | 43 | 6 | 0 |
 
-What the first run found:
+What the runs found:
 
 - **Transaction conflicts on a busy site's summary item.** Concurrent processors updating the same counters made DynamoDB cancel 41 transactions with `TransactionConflict`. Nothing was lost or double-counted, but each message waited out the 60 s visibility timeout before SQS redelivered it. The processor now retries a conflict in process with jittered backoff, which is safe because a cancelled transaction wrote nothing (slightly higher p95, no 60 s stalls). The second run logged no processing errors.
-- **The account's Lambda concurrency limit.** New AWS accounts can run 10 Lambda environments at once, shared by every function in both stacks. With the processor allowed 5, the API ran out of room and API Gateway returned `503`. The API's own throttle (25 requests/s) caps inflow and one processor handles over 100 events/s, so `MaximumConcurrency` is now 2. The remaining `503`s all fell in the first minute, while new ingest environments started; the fix for those is a concurrency quota increase, not code.
+- **The account's Lambda concurrency limit.** New AWS accounts can run 10 Lambda environments at once, shared by every function in both stacks. With the processor allowed 5, the API ran out of room and API Gateway returned `503`. The API's own throttle (25 requests/s) caps inflow and one processor handles over 100 events/s, so `MaximumConcurrency` is now 2. The remaining `503`s all fell in the first minute, while new ingest environments started; the fix for those was a concurrency quota increase, not code. With the quota at 1,000, the third run had none.
+- **Cold starts at the start of a burst** (third run). With room to scale, every request that arrives while the first environments are still starting gets a new one: about 1.4 s per cold start (0.6 s init plus a slower first request) × 20 requests/s ≈ 28, and the logs show 27. Those are the p99. Under the old limit they were `503`s instead. Steady controller traffic keeps environments warm. If a burst like this were normal, provisioned concurrency on the ingest alias would remove the delay, at a fixed hourly cost.
 
 End-to-end behavior of the core pipeline was verified by hand against the deployed stack (see [API reference and examples](#api-reference-and-examples)).
 
@@ -620,7 +624,7 @@ The production-grade version of this is separate AWS accounts per environment (A
 
 ## Deployment status
 
-Both stacks run the current release in one AWS account (us-east-1, on the AWS free plan), deployed from the same build. Everything below was verified on **`washops-dev`** on 2026-11-09, where the integration tests are allowed to write data. Prod (`washops`) was then upgraded in place from its original version and checked with read-only requests: the API now returns `401` without a token, the existing events and counters came through unchanged, and the site monitor flagged the long-silent demo site and alerted by email.
+Both stacks run in one AWS account (us-east-1, on the AWS free plan). Everything below was verified on **`washops-dev`** on 2026-11-09 and 2026-11-10, where the integration tests are allowed to write data. Prod (`washops`) was then upgraded in place from its original version and checked with read-only requests: the API now returns `401` without a token, the existing events and counters came through unchanged, and the site monitor flagged the long-silent demo site and alerted by email.
 
 | Area | Verified in AWS |
 |---|---|
@@ -629,8 +633,9 @@ Both stacks run the current release in one AWS account (us-east-1, on the AWS fr
 | Controller clock checks | ✅ `202` with a warning for a clock 2 h ahead, stored with `clockSkewSeconds`; the `controller-clock-skew` alarm fired |
 | EventBridge fan-out and fault alerts | ✅ Every new event published (0 failures); the HIGH-severity rule matched and delivered to SNS |
 | Offline-site detection | ✅ A silent site was marked `OFFLINE` 11 minutes after its last heartbeat and alerted once; the next heartbeat brought it back `ONLINE` with one recovery alert |
-| Load | ✅ 1,000 events plus 50 duplicates at 20 requests/s counted exactly once, nothing in the DLQ ([load test](#load-test)) |
-| Replay tool | ✅ Dry run found 19 archived receipts of 16 events, matching Athena |
+| Load | ✅ 1,000 events plus 50 duplicates at 20 requests/s counted exactly once, nothing in the DLQ, no errors once the account's concurrency quota was raised ([load test](#load-test)) |
+| Replay tool | ✅ Requeued a full day of the dev archive (2,190 receipts of 2,085 events) in 33 s; afterwards all six counters equal the totals Athena computes from the archive; a day outside the duplicate window is refused |
+| Reproducible builds | ✅ A clean rebuild and deploy reports "No changes to deploy"; a change redeploys only the functions that bundle the changed module |
 | Athena | ✅ All three saved queries run; partitions read across site subfolders |
 | Observability | ✅ X-Ray traces for every function, processor traces linked to the ingest request; custom EMF metrics; 10-widget CloudWatch dashboard; alarms stay `OK` under normal traffic |
 | Operations web dashboard | ✅ Signed in through Cognito's hosted UI in a headless browser and loaded live data (the screenshot above); served by CloudFront with CSP/HSTS headers from a private bucket (direct access `403`) |
