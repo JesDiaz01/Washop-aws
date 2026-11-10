@@ -12,11 +12,12 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "test:integration": "vitest run --config vitest.integration.config.mts",
     "build": "esbuild src/handlers/*.ts --bundle --platform=node --target=node22 --minify --sourcemap --outdir=dist",
     "sam:build": "sam build && node scripts/normalize-sourcemaps.mjs",
     "sam:validate": "sam validate --lint",
-    "verify": "npm run typecheck && npm run lint && npm test && npm run build"
+    "verify": "npm run typecheck && npm run lint && npm run test:coverage && npm run build"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1132.0",
@@ -32,6 +33,7 @@
     "@eslint/js": "^10.0.1",
     "@types/aws-lambda": "^8.10.163",
     "@types/node": "^22.20.2",
+    "@vitest/coverage-v8": "^5.0.5",
     "aws-sdk-client-mock": "^4.1.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.10.0",

@@ -4,6 +4,14 @@ export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
     exclude: [...configDefaults.exclude, 'tests/integration/**'], // need a deployed stack: npm run test:integration
+    // npm run test:coverage (CI runs it). The thresholds sit just under the current numbers, so a
+    // change that adds untested code fails the build.
+    coverage: {
+      provider: 'v8',
+      include: ['src/**'],
+      reporter: ['text-summary', 'text'],
+      thresholds: { lines: 95, statements: 95, functions: 95, branches: 85 },
+    },
     env: {
       LOG_LEVEL: 'silent',
       AWS_REGION: 'us-east-1',

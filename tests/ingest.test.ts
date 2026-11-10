@@ -106,6 +106,32 @@ describe('ingest handler (POST /events)', () => {
     expect(JSON.parse(response.body!).message).toBe('Request body must be valid JSON');
   });
 
+  it('returns 400 for an empty body', async () => {
+    const response = await post('');
+
+    expect(response.statusCode).toBe(400);
+    expect(JSON.parse(response.body!).message).toBe('Request body is required');
+  });
+
+  it('returns 413 for a body over 64 KB, before storing anything', async () => {
+    const response = await post(washCompletedPayload({ padding: 'x'.repeat(64 * 1024) }));
+
+    expect(response.statusCode).toBe(413);
+    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(0);
+  });
+
+  it('reads the site binding from the raw scope claim when the authorizer passes no scopes list', async () => {
+    // API Gateway leaves jwt.scopes null on routes that don't list authorization scopes.
+    const event = httpEvent({ body: JSON.stringify(washCompletedPayload()) });
+    const jwt = event.requestContext.authorizer.jwt;
+    event.requestContext.authorizer.jwt = { claims: jwt.claims, scopes: null as unknown as string[] };
+
+    expect((await handler(event, lambdaContext)).statusCode).toBe(202);
+
+    event.requestContext.authorizer.jwt = { claims: { client_id: TEST_CLIENT_ID }, scopes: null as unknown as string[] };
+    expect((await handler(event, lambdaContext)).statusCode).toBe(403); // no scopes at all: bound to no site
+  });
+
   it('returns 500 and does not enqueue when the S3 archive fails', async () => {
     s3Mock.on(PutObjectCommand).rejects(new Error('S3 unavailable'));
 

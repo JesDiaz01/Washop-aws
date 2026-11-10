@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 82 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 91 unit tests (97% line coverage) in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -19,7 +19,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
 - **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
 - **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
-- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 82 unit tests and 9 integration tests against the live stack.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 91 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -538,19 +538,21 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 82 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 91 tests across 7 files.
+
+`npm run test:coverage` reports coverage of `src/`: 97% of lines and 88% of branches. CI fails below 95% of lines, statements, and functions or 85% of branches, so new code arrives with its tests.
 
 | Area | What is tested |
 |---|---|
 | Validation | Valid events; missing/unsafe IDs; non-ISO timestamps; negative and sub-cent amounts; unsupported `eventType` message; UTC normalization; unknown fields stripped |
-| Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON; S3 failure returns `500` and does not enqueue |
+| Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON and empty body; `413` over 64 KB with nothing stored; site binding read from the raw `scope` claim when API Gateway passes no scope list; S3 failure returns `500` and does not enqueue |
 | Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; a transaction conflict retried in process, and given back to SQS if it persists; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
 | Clocks and site access | Backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
-| Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
+| Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; own event returned without storage fields; `404` for unprocessed events; `400`/`404` for a bad path value or unknown route without a DynamoDB read; generic `500` that doesn't leak the DynamoDB error; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
 | Replay | Requeue once per event with original correlation ID; SQS batches of 10, refused entries resent and reported; stops before the time limit with a resume key; days outside the duplicate window refused; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
-| Money | Floating-point conversion to integer cents |
+| Money and counters | Floating-point conversion to integer cents; the counters each event type moves (wash revenue and payment volume kept apart, so a paid wash isn't counted twice) |
 
 ### Integration tests
 
@@ -721,7 +723,7 @@ In prod, `sam delete` leaves the two DynamoDB tables and the raw events bucket i
 
 | Job | Steps |
 |---|---|
-| **verify** | `npm ci` → `npm audit` of production dependencies (fails on high/critical) → typecheck → lint → unit tests → esbuild bundle |
+| **verify** | `npm ci` → `npm audit` of production dependencies (fails on high/critical) → typecheck → lint → unit tests with coverage thresholds → esbuild bundle |
 | **sam** | install SAM CLI → `sam validate --lint` (cfn-lint) → `sam build` → upload the build as an artifact |
 | **deploy-dev** *(main only, once set up)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
 | **integration-tests** | `npm run test:integration` against `washops-dev` |

@@ -72,6 +72,40 @@ describe('query handler', () => {
     ]);
   });
 
+  it("returns the caller's own event without storage-only fields", async () => {
+    ddbMock.on(GetCommand).resolves({
+      Item: {
+        eventId: 'evt-1001',
+        locationId: 'miami-01',
+        eventType: 'WASH_COMPLETED',
+        activityAt: '2026-09-14T18:30:00.000Z',
+        expiresAt: 1_800_000_000,
+      },
+    });
+
+    const response = await get('GET /events/{eventId}', { eventId: 'evt-1001' });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body!)).toEqual({ eventId: 'evt-1001', locationId: 'miami-01', eventType: 'WASH_COMPLETED' });
+  });
+
+  it('returns a generic 500 when DynamoDB fails, without leaking the error', async () => {
+    ddbMock.on(GetCommand).rejects(new Error('ProvisionedThroughputExceededException: table test-events'));
+
+    const response = await get('GET /locations/{locationId}/summary', { locationId: 'miami-01' });
+
+    expect(response.statusCode).toBe(500);
+    expect(JSON.parse(response.body!)).toEqual({ message: 'Internal server error' });
+  });
+
+  it('rejects a malformed path value and an unknown route without reading DynamoDB', async () => {
+    const badId = await get('GET /locations/{locationId}/summary', { locationId: 'miami 01; drop' });
+    const unknown = await get('DELETE /locations/{locationId}', { locationId: 'miami-01' });
+
+    expect([badId.statusCode, unknown.statusCode]).toEqual([400, 404]);
+    expect(ddbMock.calls()).toHaveLength(0);
+  });
+
   it('returns 404 when an event has not been processed (yet)', async () => {
     ddbMock.on(GetCommand).resolves({});
 

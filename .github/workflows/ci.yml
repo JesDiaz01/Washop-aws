@@ -33,7 +33,7 @@ jobs:
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
       - run: npm run lint
-      - run: npm test
+      - run: npm run test:coverage # fails below the thresholds in vitest.config.mts
       - run: npm run build
 
   sam:

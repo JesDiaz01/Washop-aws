@@ -70,6 +70,23 @@ describe('counterIncrementsFor', () => {
     expect(counterIncrementsFor(washEventSchema.parse(heartbeatPayload()))).toEqual({});
   });
 
+  it.each([
+    ['a started wash', { eventType: 'WASH_STARTED', data: { washPackage: 'Basic', bayId: 'bay-2' } }, { washesStarted: 1 }],
+    [
+      // Payment volume is tracked apart from wash revenue, so a paid wash is never counted twice.
+      'a payment, in integer cents',
+      { eventType: 'PAYMENT_COMPLETED', data: { amount: 19.99, paymentMethod: 'CARD' } },
+      { paymentsCompleted: 1, paymentVolumeCents: 1999 },
+    ],
+    [
+      'an equipment fault',
+      { eventType: 'EQUIPMENT_FAULT', data: { equipmentId: 'dryer-1', faultCode: 'E42', severity: 'HIGH' } },
+      { equipmentFaults: 1 },
+    ],
+  ])('counts %s', (_label, overrides, expected) => {
+    expect(counterIncrementsFor(washEventSchema.parse(washCompletedPayload(overrides)))).toEqual(expected);
+  });
+
   it('avoids floating point drift when converting to cents', () => {
     expect(19.99 * 100).not.toBe(1999); // the bug we're guarding against
     expect(toCents(19.99)).toBe(1999);
