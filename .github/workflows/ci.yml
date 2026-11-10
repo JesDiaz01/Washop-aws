@@ -28,6 +28,9 @@ jobs:
           cache: npm
 
       - run: npm ci
+      # Known high or critical vulnerabilities in code that ships to Lambda fail the build; dev-only
+      # tooling is left to Dependabot so it can't block a release.
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
