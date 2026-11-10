@@ -1,6 +1,9 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, Context, SQSEvent, SQSRecord } from 'aws-lambda';
 
-export const lambdaContext = { awsRequestId: 'test-invocation-id' } as Context;
+export const lambdaContext = {
+  awsRequestId: 'test-invocation-id',
+  getRemainingTimeInMillis: () => 300_000,
+} as Context;
 
 export const TEST_CLIENT_ID = 'test-site-client';
 

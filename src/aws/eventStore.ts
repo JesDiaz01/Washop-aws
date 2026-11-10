@@ -25,7 +25,8 @@ import { getDynamoClient } from './clients';
 export const LOCATION_ACTIVITY_INDEX = 'LocationActivityIndex';
 
 const DAY_SECONDS = 24 * 60 * 60;
-const EVENT_TTL_DAYS = 90;
+/** Also how long an event is recognised as a duplicate: its item is the idempotency record. */
+export const EVENT_TTL_DAYS = 90;
 const HEARTBEAT_TTL_DAYS = 7;
 
 /**

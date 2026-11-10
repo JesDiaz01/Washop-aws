@@ -46,7 +46,8 @@ export function archivePrefix(date: string, locationId?: string): string {
   return locationId ? `raw/date=${date}/location=${locationId}/` : `raw/date=${date}/`;
 }
 
-export async function listArchiveKeys(prefix: string): Promise<string[]> {
+/** Keys under the prefix in S3's (lexicographic) order, optionally only those after `startAfter`. */
+export async function listArchiveKeys(prefix: string, startAfter?: string): Promise<string[]> {
   const keys: string[] = [];
   let continuationToken: string | undefined;
   do {
@@ -54,7 +55,8 @@ export async function listArchiveKeys(prefix: string): Promise<string[]> {
       new ListObjectsV2Command({
         Bucket: requireEnv('RAW_EVENTS_BUCKET'),
         Prefix: prefix,
-        ContinuationToken: continuationToken,
+        // Later pages continue from the token; StartAfter only positions the first one.
+        ...(continuationToken ? { ContinuationToken: continuationToken } : { StartAfter: startAfter }),
       }),
     );
     keys.push(...(page.Contents ?? []).flatMap((object) => (object.Key ? [object.Key] : [])));

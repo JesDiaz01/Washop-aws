@@ -323,7 +323,9 @@ Resources:
           - ObjectOwnership: BucketOwnerEnforced
       LifecycleConfiguration:
         Rules:
-          - Id: ExpireRawEventsAfter30Days # demo setting; production would transition to Glacier instead
+          # Demo setting; production would transition to Glacier instead. Either way, the replay tool
+          # only requeues days inside the 90-day window in which events are recognised as duplicates.
+          - Id: ExpireRawEventsAfter30Days
             Status: Enabled
             Prefix: raw/
             ExpirationInDays: 30
@@ -1011,7 +1013,7 @@ Resources:
       Description: Requeues archived events from S3, or republishes processed events to EventBridge
       CodeUri: ./
       Handler: replay.handler
-      Timeout: 300 # one day of one site's archive per run
+      Timeout: 300 # a requeue that can't finish stops ~20 s early and returns resumeAfter
       Role: !GetAtt ReplayFunctionRole.Arn
       LoggingConfig:
         LogGroup: !Ref ReplayLogGroup

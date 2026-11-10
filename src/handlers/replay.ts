@@ -2,9 +2,15 @@ import type { Context } from 'aws-lambda';
 import { z } from 'zod';
 import { archivePrefix, listArchiveKeys, readArchivedEvent } from '../aws/archive';
 import { MAX_ENTRIES_PER_CALL, publishEvents } from '../aws/eventBus';
-import { type EventItem, getEvent, toPublicEvent } from '../aws/eventStore';
-import { enqueueEvent } from '../aws/queue';
-import { eventIdSchema, locationIdSchema, toValidationIssues, washEventSchema } from '../domain/events';
+import { EVENT_TTL_DAYS, type EventItem, getEvent, toPublicEvent } from '../aws/eventStore';
+import { enqueueEvents } from '../aws/queue';
+import {
+  eventIdSchema,
+  locationIdSchema,
+  type QueueEnvelope,
+  toValidationIssues,
+  washEventSchema,
+} from '../domain/events';
 import { createLogger, type Logger } from '../shared/logger';
 
 /**
@@ -22,12 +28,19 @@ import { createLogger, type Logger } from '../shared/logger';
 
 const logger = createLogger({ service: 'washops-replay' });
 
+/** Archive objects read at once. A site's day is ~1,500 objects (a heartbeat a minute plus washes). */
+const READ_CONCURRENCY = 25;
+/** Stop starting new reads with this much time left, so a run that can't finish still reports where it stopped. */
+const TIME_RESERVE_MS = 20_000;
+
 const requestSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('requeue'),
     date: z.iso.date(), // one day's archive partition, e.g. 2026-09-14
     locationId: locationIdSchema.optional(),
     dryRun: z.boolean().default(false),
+    // Continues a run that stopped early: pass that run's `resumeAfter`.
+    startAfter: z.string().min(1).optional(),
   }),
   z.object({
     action: z.literal('republish'),
@@ -35,50 +48,105 @@ const requestSchema = z.discriminatedUnion('action', [
   }),
 ]);
 
+/**
+ * Requeueing is only safe while processed events are still recognised as duplicates, and their
+ * records expire EVENT_TTL_DAYS after processing. Events received on this date or later are all
+ * still on record; an earlier day could be counted twice. The archive expires sooner today, but this
+ * keeps a longer-lived archive (moved to Glacier, say) from making an old replay unsafe.
+ */
+export function oldestRequeueDate(now: Date): string {
+  return new Date(now.getTime() - (EVENT_TTL_DAYS - 1) * 86_400_000).toISOString().slice(0, 10);
+}
+
 type ReplayRequest = z.infer<typeof requestSchema>;
 type RequeueRequest = Extract<ReplayRequest, { action: 'requeue' }>;
 type RepublishRequest = Extract<ReplayRequest, { action: 'republish' }>;
 
-async function requeue({ date, locationId, dryRun }: RequeueRequest, log: Logger) {
+async function requeue(
+  { date, locationId, dryRun, startAfter }: RequeueRequest,
+  context: Context,
+  log: Logger,
+) {
+  const oldest = oldestRequeueDate(new Date());
+  if (date < oldest) {
+    throw new Error(
+      `Refusing to requeue ${date}: processed events are only recognised as duplicates for ` +
+        `${EVENT_TTL_DAYS} days, so this could count them twice. The oldest safe date is ${oldest}.`,
+    );
+  }
+
   const prefix = archivePrefix(date, locationId);
-  const keys = await listArchiveKeys(prefix);
+  const keys = await listArchiveKeys(prefix, startAfter);
+  // Per run: a resumed run may queue a repeat receipt again, which the processor skips as a duplicate.
   const seen = new Set<string>();
+  const notQueued: string[] = [];
   let requeued = 0;
   let repeatReceipts = 0;
   let invalid = 0;
+  let resumeAfter: string | undefined;
 
-  for (const key of keys) {
-    const record = await readArchivedEvent(key);
-    // Re-validate: the schema may have changed since the event was archived.
-    const parsed = washEventSchema.safeParse(record.payload);
-    if (!parsed.success) {
-      invalid += 1;
-      log.warn('Archived payload does not pass current validation; skipped', {
-        key,
-        errors: toValidationIssues(parsed.error),
-      });
-      continue;
+  for (let start = 0; start < keys.length; start += READ_CONCURRENCY) {
+    if (start > 0 && context.getRemainingTimeInMillis() < TIME_RESERVE_MS) {
+      resumeAfter = keys[start - 1];
+      break;
     }
 
-    // A controller retry archives one object per receipt; queue each event once.
-    if (seen.has(parsed.data.eventId)) {
-      repeatReceipts += 1;
-      continue;
-    }
-    seen.add(parsed.data.eventId);
+    const chunk = keys.slice(start, start + READ_CONCURRENCY);
+    const records = await Promise.all(chunk.map(async (key) => ({ key, record: await readArchivedEvent(key) })));
+    const envelopes: QueueEnvelope[] = [];
 
-    if (!dryRun) {
-      await enqueueEvent({
+    // In key order, so the event's first archived receipt is the one requeued.
+    for (const { key, record } of records) {
+      // Re-validate: the schema may have changed since the event was archived.
+      const parsed = washEventSchema.safeParse(record.payload);
+      if (!parsed.success) {
+        invalid += 1;
+        log.warn('Archived payload does not pass current validation; skipped', {
+          key,
+          errors: toValidationIssues(parsed.error),
+        });
+        continue;
+      }
+
+      // A controller retry archives one object per receipt; queue each event once.
+      if (seen.has(parsed.data.eventId)) {
+        repeatReceipts += 1;
+        continue;
+      }
+      seen.add(parsed.data.eventId);
+
+      envelopes.push({
         correlationId: record.correlationId, // keeps the original trace
         receivedAt: record.receivedAt,
         archiveKey: key,
         event: parsed.data,
       });
     }
-    requeued += 1;
+
+    const refused = dryRun ? [] : await enqueueEvents(envelopes);
+    notQueued.push(...refused.map((envelope) => envelope.archiveKey));
+    requeued += envelopes.length - refused.length;
   }
 
-  return { action: 'requeue', prefix, dryRun, archivedObjects: keys.length, requeued, repeatReceipts, invalid };
+  if (notQueued.length > 0) {
+    log.error('SQS refused some events after retries; run again to requeue them', { archiveKeys: notQueued });
+  }
+  if (resumeAfter) {
+    log.warn('Stopped before the time limit; run again with startAfter to continue', { resumeAfter });
+  }
+
+  return {
+    action: 'requeue',
+    prefix,
+    dryRun,
+    archivedObjects: keys.length,
+    requeued,
+    repeatReceipts,
+    invalid,
+    failed: notQueued.length,
+    complete: resumeAfter === undefined,
+    ...(resumeAfter && { resumeAfter }),
+  };
 }
 
 async function republish({ eventIds }: RepublishRequest, log: Logger) {
@@ -114,7 +182,8 @@ export const handler = async (event: unknown, context: Context) => {
 
   const request = parsed.data;
   log.info('Replay started', { request });
-  const result = request.action === 'requeue' ? await requeue(request, log) : await republish(request, log);
+  const result =
+    request.action === 'requeue' ? await requeue(request, context, log) : await republish(request, log);
   log.info('Replay complete', { result });
   return result;
 };
