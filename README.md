@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 73 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 78 unit tests in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -19,7 +19,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
 - **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
 - **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
-- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 73 unit tests and 9 integration tests against the live stack.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 78 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -243,7 +243,7 @@ A site whose network drops sends nothing, so no error ever reaches the API. The 
 3. **Claim, then alert.** The change is recorded with a conditional update (`lastHeartbeat` still equals what was read, and the state is still the old one). Only the run that wins that write sends the SNS email. A heartbeat that lands between the read and the write makes the condition fail, so it can't produce a false alarm; overlapping or retried runs can't alert twice.
 4. If the email fails, the claim is undone and the run fails, so Scheduler's retry or the next run sends it.
 
-The API reports the result: `connectivity` (`ONLINE`, `OFFLINE`, or `UNKNOWN` if no heartbeat was ever received) and `connectivityChangedAt` on every location summary, as of the last check. The monitor also emits an `OfflineSites` metric for the dashboard.
+The API reports the result: `connectivity` (`ONLINE`, `OFFLINE`, or `UNKNOWN` if no heartbeat was ever received) and `connectivityChangedAt` on every location summary, as of the last check, with one exception: a heartbeat received after a site was marked `OFFLINE` shows it `ONLINE` straight away, since that heartbeat is proof. The monitor still records the change and sends the recovery email on its next run. It also emits an `OfflineSites` metric for the dashboard.
 
 > On the first run after deploying, any site whose last heartbeat is old (for example the demo `miami-01` from September) is reported offline immediately: one email per site.
 
@@ -535,7 +535,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 73 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 78 tests across 7 files.
 
 | Area | What is tested |
 |---|---|
@@ -543,7 +543,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON; S3 failure returns `500` and does not enqueue |
 | Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; a transaction conflict retried in process, and given back to SQS if it persists; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
 | Clocks and site access | Backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
-| Query | Cents → dollars mapping; connectivity in summaries; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
+| Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; `404` for unprocessed events; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
 | Replay | Requeue once per event with original correlation ID; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
@@ -691,6 +691,8 @@ Both stacks run the current release in one AWS account (us-east-1, on the AWS fr
    Cognito emails a temporary password; open `DashboardUrl` and sign in.
 
 > **Build note:** SAM's esbuild builder does not find esbuild when it is only a project devDependency, so `npm run sam:build` runs `sam build` through npm, which puts `node_modules/.bin` on PATH. Avoid `sam build --build-in-source` with this layout: it performs a production-only install in the project directory, which removes devDependencies.
+>
+> **Reproducible builds:** SAM bundles each function in a randomly named temporary folder, and esbuild records source paths relative to it in the source maps, so identical code produced a different artifact every build and every deploy published a new version of all six functions. `npm run sam:build` therefore finishes with `scripts/normalize-sourcemaps.mjs`, which rewrites those paths relative to the project. Two consecutive builds are now byte-identical, so a deploy only updates the functions whose code changed.
 
 **Cost:** everything is pay-per-use with no idle compute; demo-scale usage of Lambda, API Gateway, SQS, DynamoDB, EventBridge, Scheduler, CloudFront, Athena, and X-Ray stays within free tiers or costs cents. The standing items are CloudWatch alarms (the two metric-math alarms count each of their six metrics), custom metrics (`OfflineSites` is emitted every 5 minutes), and point-in-time recovery storage: roughly a few dollars a month at most, partly covered by CloudWatch's free tier. Cognito bills machine-to-machine token requests with no free tier; one token per script run is a fraction of a cent. Check the AWS Pricing Calculator for your own numbers.
 
@@ -714,7 +716,7 @@ In prod, `sam delete` leaves the two DynamoDB tables and the raw events bucket i
 
 | Job | Steps |
 |---|---|
-| **verify** | `npm ci` → typecheck → lint → unit tests → esbuild bundle |
+| **verify** | `npm ci` → `npm audit` of production dependencies (fails on high/critical) → typecheck → lint → unit tests → esbuild bundle |
 | **sam** | install SAM CLI → `sam validate --lint` (cfn-lint) → `sam build` → upload the build as an artifact |
 | **deploy-dev** *(main only, once set up)* | assume the deploy role with GitHub OIDC → `sam deploy --config-env ci-dev` |
 | **integration-tests** | `npm run test:integration` against `washops-dev` |
@@ -855,7 +857,7 @@ HTTP 200
 }
 ```
 
-`lastHeartbeat` is when the server received the latest heartbeat, and `controllerClockSkewSeconds` is how far that controller's clock was off (here 1 s behind). `connectivity` is the site monitor's verdict: `ONLINE`, `OFFLINE`, or `UNKNOWN` before the first heartbeat; `connectivityChangedAt` is when it last changed.
+`lastHeartbeat` is when the server received the latest heartbeat, and `controllerClockSkewSeconds` is how far that controller's clock was off (here 1 s behind). `connectivity` is the site monitor's verdict: `ONLINE`, `OFFLINE`, or `UNKNOWN` before the first heartbeat, and `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `connectivityChangedAt` is when the monitor last changed it.
 
 ### `GET /locations`
 
