@@ -13,6 +13,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "openapi": "vitest run tests/openapi.test.ts --update",
     "test:integration": "vitest run --config vitest.integration.config.mts",
     "build": "esbuild src/handlers/*.ts --bundle --platform=node --target=node22 --minify --sourcemap --outdir=dist",
     "sam:build": "sam build && node scripts/normalize-sourcemaps.mjs",

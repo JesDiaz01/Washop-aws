@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
+import type { EventAcceptedResponse } from '../api/responses';
 import { archiveRawEvent } from '../aws/archive';
 import { enqueueEvent } from '../aws/queue';
 import { clockSkewSeconds, describeSkew, isClockSuspect } from '../domain/clock';
@@ -97,7 +98,7 @@ export const handler = async (
         eventId: washEvent.eventId,
         correlationId,
         ...(warnings.length > 0 ? { warnings } : {}),
-      },
+      } satisfies EventAcceptedResponse,
       responseHeaders,
     );
   } catch (error) {

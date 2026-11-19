@@ -2,6 +2,7 @@ import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { mockClient } from 'aws-sdk-client-mock';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { errorResponseSchema, eventAcceptedSchema } from '../src/api/responses';
 import { handler } from '../src/handlers/ingest';
 import { washCompletedPayload } from './fixtures';
 import { httpEvent, lambdaContext, TEST_CLIENT_ID } from './helpers';
@@ -104,6 +105,14 @@ describe('ingest handler (POST /events)', () => {
 
     expect(response.statusCode).toBe(400);
     expect(JSON.parse(response.body!).message).toBe('Request body must be valid JSON');
+  });
+
+  it('responds as the published contract says (docs/openapi.json), with no undocumented fields', async () => {
+    const accepted = await post(washCompletedPayload({ timestamp: '2019-01-01T00:00:00Z' })); // wrong clock
+    const invalid = await post(washCompletedPayload({ timestamp: 'yesterday' }));
+
+    expect(eventAcceptedSchema.parse(JSON.parse(accepted.body!)).warnings).toHaveLength(1);
+    expect(errorResponseSchema.parse(JSON.parse(invalid.body!)).errors?.[0]?.path).toBe('timestamp');
   });
 
   it('returns 400 for an empty body', async () => {

@@ -1,7 +1,17 @@
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { mockClient } from 'aws-sdk-client-mock';
 import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  errorResponseSchema,
+  locationListSchema,
+  locationSummarySchema,
+  processedEventSchema,
+  recentEventsSchema,
+} from '../src/api/responses';
+import { toEventItem } from '../src/aws/eventStore';
+import { washEventSchema } from '../src/domain/events';
 import { handler } from '../src/handlers/query';
+import { envelopeFor, washCompletedPayload } from './fixtures';
 import { httpEvent, lambdaContext, TEST_CLIENT_ID, TEST_SCOPES } from './helpers';
 
 const ddbMock = mockClient(DynamoDBDocumentClient);
@@ -170,5 +180,54 @@ describe('query handler: site credentials read only their own site', () => {
 
     expect(locationIds(list.body)).toEqual([]);
     expect(summary.statusCode).toBe(403);
+  });
+});
+
+describe('query handler: responses match the published contract (docs/openapi.json)', () => {
+  // Realistic stored items, so every documented field is present and checked.
+  const summaryItem = {
+    locationId: 'miami-01',
+    washesStarted: 3,
+    completedWashes: 2,
+    washRevenueCents: 4400,
+    paymentsCompleted: 2,
+    paymentVolumeCents: 4400,
+    equipmentFaults: 1,
+    lastHeartbeat: '2026-09-14T18:31:00.000Z',
+    controllerClockSkewSeconds: -2,
+    connectivity: 'OFFLINE',
+    connectivityChangedAt: '2026-09-14T18:20:03.000Z',
+    lastUpdated: '2026-09-14T18:31:00.120Z',
+  };
+  const storedEvent = (overrides: Record<string, unknown> = {}) =>
+    toEventItem(envelopeFor(washEventSchema.parse(washCompletedPayload(overrides))), new Date('2026-09-14T18:30:02Z'));
+
+  const body = (response: { body?: string }) => JSON.parse(response.body!) as unknown;
+
+  beforeEach(() => {
+    ddbMock.reset();
+    ddbMock.on(ScanCommand).resolves({ Items: [summaryItem] });
+    ddbMock.on(GetCommand).resolves({ Item: summaryItem });
+    ddbMock.on(QueryCommand).resolves({ Items: [storedEvent(), storedEvent({ timestamp: '2026-09-14T20:30:00Z' })] });
+  });
+
+  it('every success body parses with its schema, with no undocumented fields', async () => {
+    locationListSchema.parse(body(await get('GET /locations', {}, { caller: dashboardUser })));
+    locationSummarySchema.parse(body(await get('GET /locations/{locationId}/summary', { locationId: 'miami-01' })));
+
+    const recent = recentEventsSchema.parse(
+      body(await get('GET /locations/{locationId}/events', { locationId: 'miami-01' })),
+    );
+    expect(recent.events[1]).toHaveProperty('clockSkewSeconds'); // the optional field was exercised too
+
+    ddbMock.on(GetCommand).resolves({ Item: storedEvent() });
+    processedEventSchema.parse(body(await get('GET /events/{eventId}', { eventId: 'evt-1001' })));
+  });
+
+  it('error bodies parse with the Error schema', async () => {
+    ddbMock.on(GetCommand).resolves({});
+
+    errorResponseSchema.parse(body(await get('GET /events/{eventId}', { eventId: 'evt-gone' })));
+    errorResponseSchema.parse(body(await get('GET /locations/{locationId}/summary', { locationId: 'tampa-02' })));
   });
 });

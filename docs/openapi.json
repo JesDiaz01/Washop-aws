@@ -1,0 +1,1059 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "WashOps API",
+    "version": "1.0.0",
+    "description": "Car wash controllers send operational events; the operations dashboard reads per-site summaries and recent activity. Events are accepted asynchronously (202) and processed exactly once. A site credential may send and read only its own location (scope washops/site.<locationId>)."
+  },
+  "servers": [
+    {
+      "url": "{apiBaseUrl}",
+      "variables": {
+        "apiBaseUrl": {
+          "default": "https://api.example.com",
+          "description": "The stack's ApiBaseUrl output"
+        }
+      }
+    }
+  ],
+  "paths": {
+    "/events": {
+      "post": {
+        "operationId": "sendEvent",
+        "summary": "Send one controller event",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "x-correlation-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "At most 64 KB. Unknown fields are ignored (and kept in the raw archive).",
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/WashStartedEvent"
+                  },
+                  {
+                    "$ref": "#/components/schemas/WashCompletedEvent"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PaymentCompletedEvent"
+                  },
+                  {
+                    "$ref": "#/components/schemas/EquipmentFaultEvent"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ControllerHeartbeatEvent"
+                  }
+                ],
+                "discriminator": {
+                  "propertyName": "eventType"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Archived and queued for processing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventAccepted"
+                }
+              }
+            },
+            "headers": {
+              "x-correlation-id": {
+                "description": "Echoes the request header, or the ID generated for this request; it is on every log line",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON or event, with one entry per invalid field",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This credential isn't bound to the event's locationId; nothing was stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body larger than 64 KB",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/locations": {
+      "get": {
+        "operationId": "listLocations",
+        "summary": "Summaries of every site this credential may read",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted by locationId",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocationList"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/locations/{locationId}/summary": {
+      "get": {
+        "operationId": "getLocationSummary",
+        "summary": "One site's counters and connectivity",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "locationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{2,64}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocationSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid locationId",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This credential may not read the site's data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No events recorded for this site yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/locations/{locationId}/events": {
+      "get": {
+        "operationId": "listRecentEvents",
+        "summary": "A site's recent activity, newest first",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "locationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{2,64}$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 20
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recent events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecentEvents"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid locationId or limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This credential may not read the site's data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/events/{eventId}": {
+      "get": {
+        "operationId": "getEvent",
+        "summary": "One processed event",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "eventId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The event as stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessedEvent"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid eventId",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not processed yet (processing is asynchronous), or another site's event: both get the same answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "cognito": {
+        "type": "oauth2",
+        "description": "Amazon Cognito. Site controllers use client credentials; the dashboard signs people in with the authorization code flow and PKCE. The real URLs are the stack's TokenUrl and AuthDomain outputs.",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://auth.example.com/oauth2/token",
+            "scopes": {
+              "washops/events.write": "Send events",
+              "washops/events.read": "Read summaries and events",
+              "washops/site.{locationId}": "Binds a site credential to one location, for both sending and reading"
+            }
+          },
+          "authorizationCode": {
+            "authorizationUrl": "https://auth.example.com/oauth2/authorize",
+            "tokenUrl": "https://auth.example.com/oauth2/token",
+            "scopes": {
+              "washops/events.read": "Read every site (dashboard users)"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "WashStartedEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "timestamp": {
+            "description": "When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far from server time is still accepted, with a warning.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "eventType": {
+            "type": "string",
+            "const": "WASH_STARTED"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "washPackage": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "bayId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "washPackage"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "timestamp",
+          "eventType",
+          "data"
+        ]
+      },
+      "WashCompletedEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "timestamp": {
+            "description": "When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far from server time is still accepted, with a warning.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "eventType": {
+            "type": "string",
+            "const": "WASH_COMPLETED"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "washPackage": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "amount": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 10000,
+                "description": "Dollars, at most 2 decimal places (e.g. 22.00)"
+              },
+              "durationSeconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3600
+              }
+            },
+            "required": [
+              "washPackage",
+              "amount",
+              "durationSeconds"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "timestamp",
+          "eventType",
+          "data"
+        ]
+      },
+      "PaymentCompletedEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "timestamp": {
+            "description": "When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far from server time is still accepted, with a warning.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "eventType": {
+            "type": "string",
+            "const": "PAYMENT_COMPLETED"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 10000,
+                "description": "Dollars, at most 2 decimal places (e.g. 22.00)"
+              },
+              "paymentMethod": {
+                "type": "string",
+                "enum": [
+                  "CARD",
+                  "CASH",
+                  "MOBILE",
+                  "MEMBERSHIP"
+                ]
+              },
+              "transactionId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "amount",
+              "paymentMethod"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "timestamp",
+          "eventType",
+          "data"
+        ]
+      },
+      "EquipmentFaultEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "timestamp": {
+            "description": "When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far from server time is still accepted, with a warning.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "eventType": {
+            "type": "string",
+            "const": "EQUIPMENT_FAULT"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "equipmentId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "faultCode": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "LOW",
+                  "MEDIUM",
+                  "HIGH",
+                  "CRITICAL"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "maxLength": 500
+              }
+            },
+            "required": [
+              "equipmentId",
+              "faultCode",
+              "severity"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "timestamp",
+          "eventType",
+          "data"
+        ]
+      },
+      "ControllerHeartbeatEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "timestamp": {
+            "description": "When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far from server time is still accepted, with a warning.",
+            "type": "string",
+            "format": "date-time"
+          },
+          "eventType": {
+            "type": "string",
+            "const": "CONTROLLER_HEARTBEAT"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "controllerId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "firmwareVersion": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "uptimeSeconds": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "controllerId"
+            ]
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "timestamp",
+          "eventType",
+          "data"
+        ]
+      },
+      "EventAccepted": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "const": "Event accepted"
+          },
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "correlationId": {
+            "type": "string"
+          },
+          "warnings": {
+            "description": "Present when the controller's clock looks wrong; the event is still accepted",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "message",
+          "eventId",
+          "correlationId"
+        ]
+      },
+      "LocationSummary": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "washesStarted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completedWashes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "totalRevenue": {
+            "type": "number",
+            "description": "Dollars, converted from the integer cents stored"
+          },
+          "paymentsCompleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "paymentVolume": {
+            "type": "number",
+            "description": "Dollars, converted from the integer cents stored"
+          },
+          "equipmentFaults": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastHeartbeat": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Server receipt time of the latest heartbeat"
+          },
+          "controllerClockSkewSeconds": {
+            "description": "From the latest heartbeat: how far the controller's clock is off (positive = ahead)",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "connectivity": {
+            "type": "string",
+            "enum": [
+              "ONLINE",
+              "OFFLINE",
+              "UNKNOWN"
+            ],
+            "description": "UNKNOWN: no heartbeat received yet"
+          },
+          "connectivityChangedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastUpdated": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "locationId",
+          "washesStarted",
+          "completedWashes",
+          "totalRevenue",
+          "paymentsCompleted",
+          "paymentVolume",
+          "equipmentFaults",
+          "lastHeartbeat",
+          "controllerClockSkewSeconds",
+          "connectivity",
+          "connectivityChangedAt",
+          "lastUpdated"
+        ]
+      },
+      "LocationList": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "locations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LocationSummary"
+            },
+            "description": "Sites this credential may read, sorted by ID"
+          }
+        },
+        "required": [
+          "count",
+          "locations"
+        ]
+      },
+      "ProcessedEvent": {
+        "type": "object",
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          },
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "eventType": {
+            "type": "string",
+            "enum": [
+              "WASH_STARTED",
+              "WASH_COMPLETED",
+              "PAYMENT_COMPLETED",
+              "EQUIPMENT_FAULT",
+              "CONTROLLER_HEARTBEAT"
+            ]
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The controller's timestamp, kept even when its clock is wrong"
+          },
+          "receivedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "processedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "correlationId": {
+            "type": "string"
+          },
+          "archiveKey": {
+            "type": "string",
+            "description": "S3 key of the raw payload as received"
+          },
+          "data": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "The validated data object for this eventType"
+          },
+          "clockSkewSeconds": {
+            "description": "Present when the controller clock looked wrong: timestamp minus receivedAt",
+            "type": "number"
+          }
+        },
+        "required": [
+          "eventId",
+          "locationId",
+          "eventType",
+          "occurredAt",
+          "receivedAt",
+          "processedAt",
+          "correlationId",
+          "archiveKey",
+          "data"
+        ]
+      },
+      "RecentEvents": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcessedEvent"
+            },
+            "description": "Newest first; heartbeats are not listed"
+          }
+        },
+        "required": [
+          "locationId",
+          "count",
+          "events"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "correlationId": {
+            "description": "POST /events only",
+            "type": "string"
+          },
+          "errors": {
+            "description": "One entry per invalid field (400 on POST /events)",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "message"
+              ]
+            }
+          }
+        },
+        "required": [
+          "message"
+        ]
+      }
+    }
+  }
+}

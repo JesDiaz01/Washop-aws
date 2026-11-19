@@ -1,4 +1,5 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
+import type { LocationListResponse, LocationSummaryResponse, RecentEventsResponse } from '../api/responses';
 import {
   getEvent,
   getLocationSummary,
@@ -67,7 +68,7 @@ function requireReadable(sites: ReadableSites, locationId: string): void {
 
 const centsToDollars = (cents: number | undefined) => (cents ?? 0) / 100;
 
-export function toSummaryResponse(item: LocationSummaryItem) {
+export function toSummaryResponse(item: LocationSummaryItem): LocationSummaryResponse {
   return {
     locationId: item.locationId,
     washesStarted: item.washesStarted ?? 0,
@@ -96,7 +97,7 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
         .filter((summary) => canRead(sites, summary.locationId))
         .map(toSummaryResponse)
         .sort((a, b) => a.locationId.localeCompare(b.locationId));
-      return jsonResponse(200, { count: locations.length, locations });
+      return jsonResponse(200, { count: locations.length, locations } satisfies LocationListResponse);
     }
 
     case 'GET /locations/{locationId}/summary': {
@@ -112,7 +113,11 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
       requireReadable(sites, locationId);
       const limit = parseLimit(event.queryStringParameters?.limit);
       const items = await listRecentEvents(locationId, limit);
-      return jsonResponse(200, { locationId, count: items.length, events: items.map(toPublicEvent) });
+      return jsonResponse(200, {
+        locationId,
+        count: items.length,
+        events: items.map(toPublicEvent),
+      } satisfies RecentEventsResponse);
     }
 
     case 'GET /events/{eventId}': {

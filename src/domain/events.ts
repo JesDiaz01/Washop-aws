@@ -31,7 +31,12 @@ export const locationIdSchema = z
 // so stored timestamps sort correctly as strings.
 const timestampSchema = z.iso
   .datetime({ offset: true })
-  .transform((value) => new Date(value).toISOString());
+  .transform((value) => new Date(value).toISOString())
+  .meta({
+    description:
+      'When it happened, by the controller clock: ISO-8601 with an offset, stored in UTC. A time far ' +
+      'from server time is still accepted, with a warning.',
+  });
 
 // Money arrives as decimal dollars (e.g. 22.00) and is converted to integer cents before storage.
 const amountSchema = z
@@ -40,7 +45,8 @@ const amountSchema = z
   .max(10_000)
   .refine((value) => Math.abs(value * 100 - Math.round(value * 100)) < 1e-6, {
     message: 'amount must have at most 2 decimal places',
-  });
+  })
+  .meta({ description: 'Dollars, at most 2 decimal places (e.g. 22.00)' });
 
 const shortText = z.string().trim().min(1).max(64);
 

@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 91 unit tests (97% line coverage) in CI, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 97 unit tests (97% line coverage) in CI, an [OpenAPI contract](docs/openapi.json) generated from the validation schemas, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -19,7 +19,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
 - **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
 - **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
-- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 91 unit tests and 9 integration tests against the live stack.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 97 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -523,12 +523,14 @@ src/
   domain/          business rules, no AWS SDK: event schemas, counters, connectivity, clocks, site access
   aws/             everything that talks to AWS: S3 archive, SQS, DynamoDB store, EventBridge, SNS, SDK clients
   shared/          structured logger, EMF metrics, HTTP helpers, errors, config
+  api/             response schemas and the OpenAPI generator (the published API contract)
 tests/             unit tests with mocked AWS SDK clients
 tests/integration/ end-to-end tests against a deployed stack
 dashboard/         operations dashboard (static HTML/CSS/JS)
 deploy/            one-time setup template for GitHub Actions deploys (OIDC)
+docs/openapi.json  OpenAPI 3.1 contract, generated from the schemas (npm run openapi)
 events/            sample payloads
-scripts/           send-sample-events.mjs (exercise a deployed API), publish-dashboard.mjs
+scripts/           send-sample-events.mjs, load-test.mjs, publish-dashboard.mjs, normalize-sourcemaps.mjs
 template.yaml      all application infrastructure (AWS SAM)
 ```
 
@@ -538,7 +540,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 91 tests across 7 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 97 tests across 8 files.
 
 `npm run test:coverage` reports coverage of `src/`: 97% of lines and 88% of branches. CI fails below 95% of lines, statements, and functions or 85% of branches, so new code arrives with its tests.
 
@@ -553,6 +555,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
 | Replay | Requeue once per event with original correlation ID; SQS batches of 10, refused entries resent and reported; stops before the time limit with a resume key; days outside the duplicate window refused; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
 | Money and counters | Floating-point conversion to integer cents; the counters each event type moves (wash revenue and payment volume kept apart, so a paid wash isn't counted twice) |
+| API contract | Every success and error body from ingest and query parses with its strict response schema; `docs/openapi.json` matches the schemas; its routes and scopes match `template.yaml`; every `$ref` resolves |
 
 ### Integration tests
 
@@ -755,6 +758,12 @@ The deploy role can do almost nothing by itself: upload artifacts to one bucket,
 The AWS jobs are skipped until `AWS_DEPLOY_ROLE_ARN` exists, so CI keeps working before setup. Deploys keep each stack's current parameter values (including `AlarmEmail`).
 
 ## API reference and examples
+
+**Contract:** [`docs/openapi.json`](docs/openapi.json) (OpenAPI 3.1) describes every route, scope, request, response, and error. Paste it into [editor.swagger.io](https://editor.swagger.io) to browse it, or generate a client from it. It is generated from the code, not written by hand:
+
+- Request schemas are the zod schemas that validate events at the API. Response schemas (`src/api/responses.ts`) type what the handlers return.
+- Unit tests parse real handler responses with the response schemas, so an undocumented field fails the build.
+- `tests/openapi.test.ts` fails if the committed file is out of date (`npm run openapi` regenerates it), or if its routes and scopes differ from what `template.yaml` deploys.
 
 Responses below are real responses from the deployed stack. The base URL is the `ApiBaseUrl` stack output. Every request needs `Authorization: Bearer <access token>`; get one from the `TokenUrl` output:
 
@@ -960,9 +969,9 @@ These are **not implemented**:
 - **Environments:** separate AWS accounts per environment under AWS Organizations; a staging stage with production-like data.
 - **Observability:** SDK-level tracing (Powertools for AWS Lambda or OpenTelemetry) for per-call subsegments; Powertools could also replace the hand-written logger and EMF helper. Alarms on DynamoDB throttling.
 - **Data durability:** lifecycle transition to Glacier instead of expiry, and S3 Object Lock where audit retention is regulated; customer-managed KMS keys if required.
-- **Scale:** Kinesis Data Streams or Firehose for very high event rates and batched archiving; FIFO queues with `MessageGroupId = locationId` if strict per-site ordering becomes a requirement; a Lambda concurrency quota increase, then reserved concurrency so the API can never be starved by background work (the [load test](#load-test) hit the 10-environment default); for one very busy site, sharded counters or one aggregated update per batch instead of per event; pagination tokens on list endpoints; Step Functions or S3 Batch Operations for large replays.
+- **Scale:** Kinesis Data Streams or Firehose for very high event rates and batched archiving; FIFO queues with `MessageGroupId = locationId` if strict per-site ordering becomes a requirement; reserved concurrency so the API can never be starved by background work (the account's quota is already raised from the default 10; see the [load test](#load-test)); for one very busy site, sharded counters or one aggregated update per batch instead of per event; pagination tokens on list endpoints; Step Functions or S3 Batch Operations for large replays.
 - **Relational integration:** location master data (sites, owners, pricing) typically lives in a relational system such as Aurora PostgreSQL. A natural pattern is an EventBridge rule → Lambda → PostgreSQL for reporting, or enrichment from the relational system on the read path, using RDS Proxy for connection pooling.
-- **Schema evolution:** versioned event contracts (`schemaVersion`), contract tests shared with controller firmware teams, and a schema registry (EventBridge Schema Registry fits the bus).
+- **Schema evolution:** versioned event contracts (`schemaVersion`), [`docs/openapi.json`](docs/openapi.json) shared with controller firmware teams as their contract test fixture, and a schema registry (EventBridge Schema Registry fits the bus).
 - **Clocks:** alert per site (today the alarm is fleet-wide and the dashboard names the site), and have controllers sync from a time source the API provides.
 
 ## License
