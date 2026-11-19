@@ -20,9 +20,9 @@ jobs:
     name: Typecheck, lint, test, bundle
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc # Node 22, same as the Lambda runtime
           cache: npm
@@ -44,14 +44,14 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1 # required by the SAM CLI; nothing is deployed here
       SAM_CLI_TELEMETRY: 0
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
 
@@ -61,7 +61,7 @@ jobs:
       - run: npm run sam:build
 
       # Build once; dev and prod deploy these exact bundles.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           name: sam-build
@@ -84,18 +84,18 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       SAM_CLI_TELEMETRY: 0
     steps:
-      - uses: actions/checkout@v5 # for samconfig.toml
+      - uses: actions/checkout@v7 # for samconfig.toml
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sam-build
           path: .aws-sam/build
 
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           role-session-name: washops-deploy-dev-${{ github.run_id }}
@@ -120,14 +120,14 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       WASHOPS_STACK: washops-dev
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version-file: .nvmrc
           cache: npm
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           role-session-name: washops-integration-${{ github.run_id }}
@@ -150,18 +150,18 @@ jobs:
       AWS_DEFAULT_REGION: us-east-1
       SAM_CLI_TELEMETRY: 0
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sam-build
           path: .aws-sam/build
 
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           role-session-name: washops-deploy-prod-${{ github.run_id }}
