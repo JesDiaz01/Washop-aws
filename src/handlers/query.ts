@@ -1,8 +1,15 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer, APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
-import type { LocationListResponse, LocationSummaryResponse, RecentEventsResponse } from '../api/responses';
+import type {
+  LocationListResponse,
+  LocationSummaryResponse,
+  RecentEventsResponse,
+  TrendResponse,
+} from '../api/responses';
 import {
   getEvent,
   getLocationSummary,
+  type HourlyStatsItem,
+  listHourlyStats,
   listLocationSummaries,
   listRecentEvents,
   type LocationSummaryItem,
@@ -10,6 +17,7 @@ import {
 } from '../aws/eventStore';
 import { reportedConnectivity } from '../domain/connectivity';
 import { eventIdSchema, locationIdSchema } from '../domain/events';
+import { firstHourOfWindow, hourStart } from '../domain/hours';
 import { boundSites } from '../domain/siteAccess';
 import { requireEnv } from '../shared/config';
 import { BadRequestError, ForbiddenError, HttpError, NotFoundError } from '../shared/errors';
@@ -22,13 +30,14 @@ import { createLogger, serializeError } from '../shared/logger';
  *   GET /locations
  *   GET /locations/{locationId}/summary
  *   GET /locations/{locationId}/events?limit=20
+ *   GET /locations/{locationId}/trend?hours=168
  *   GET /events/{eventId}
  */
 
 const logger = createLogger({ service: 'washops-query' });
 
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 50;
+const LIMIT = { name: 'limit', fallback: 20, max: 50 };
+const TREND_HOURS = { name: 'hours', fallback: 168, max: 720 }; // 7 days by default, up to 30
 
 function pathParam(event: APIGatewayProxyEventV2WithJWTAuthorizer, name: string, schema: typeof eventIdSchema): string {
   const result = schema.safeParse(event.pathParameters?.[name]);
@@ -38,13 +47,13 @@ function pathParam(event: APIGatewayProxyEventV2WithJWTAuthorizer, name: string,
   return result.data;
 }
 
-function parseLimit(raw: string | undefined): number {
-  if (raw === undefined) return DEFAULT_LIMIT;
-  const limit = Number(raw);
-  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
-    throw new BadRequestError(`limit must be an integer between 1 and ${MAX_LIMIT}`);
+function parseCount(raw: string | undefined, { name, fallback, max }: typeof LIMIT): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw new BadRequestError(`${name} must be an integer between 1 and ${max}`);
   }
-  return limit;
+  return value;
 }
 
 /**
@@ -88,6 +97,16 @@ export function toSummaryResponse(item: LocationSummaryItem): LocationSummaryRes
   };
 }
 
+const toHourlyResponse = (item: HourlyStatsItem): TrendResponse['hours'][number] => ({
+  hour: hourStart(item.hour),
+  washesStarted: item.washesStarted ?? 0,
+  completedWashes: item.completedWashes ?? 0,
+  revenue: centsToDollars(item.washRevenueCents),
+  paymentsCompleted: item.paymentsCompleted ?? 0,
+  paymentVolume: centsToDollars(item.paymentVolumeCents),
+  equipmentFaults: item.equipmentFaults ?? 0,
+});
+
 async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<APIGatewayProxyStructuredResultV2> {
   const sites = readableSites(event);
 
@@ -111,13 +130,26 @@ async function route(event: APIGatewayProxyEventV2WithJWTAuthorizer): Promise<AP
     case 'GET /locations/{locationId}/events': {
       const locationId = pathParam(event, 'locationId', locationIdSchema);
       requireReadable(sites, locationId);
-      const limit = parseLimit(event.queryStringParameters?.limit);
+      const limit = parseCount(event.queryStringParameters?.limit, LIMIT);
       const items = await listRecentEvents(locationId, limit);
       return jsonResponse(200, {
         locationId,
         count: items.length,
         events: items.map(toPublicEvent),
       } satisfies RecentEventsResponse);
+    }
+
+    case 'GET /locations/{locationId}/trend': {
+      const locationId = pathParam(event, 'locationId', locationIdSchema);
+      requireReadable(sites, locationId);
+      const hours = parseCount(event.queryStringParameters?.hours, TREND_HOURS);
+      const fromHour = firstHourOfWindow(new Date(), hours);
+      const items = await listHourlyStats(locationId, fromHour);
+      return jsonResponse(200, {
+        locationId,
+        from: hourStart(fromHour),
+        hours: items.map(toHourlyResponse),
+      } satisfies TrendResponse);
     }
 
     case 'GET /events/{eventId}': {

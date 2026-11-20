@@ -10,7 +10,8 @@ import {
 import { clockSkewSeconds, isClockSuspect } from '../domain/clock';
 import type { Connectivity, ReportingSite, SiteHeartbeat } from '../domain/connectivity';
 import type { QueueEnvelope, WashEvent } from '../domain/events';
-import { counterIncrementsFor } from '../domain/summary';
+import { hourOf, hourStart } from '../domain/hours';
+import { type CounterIncrements, counterIncrementsFor } from '../domain/summary';
 import { requireEnv } from '../shared/config';
 import { getDynamoClient } from './clients';
 
@@ -20,6 +21,7 @@ import { getDynamoClient } from './clients';
  * EventsTable           PK: eventId      -> one item per processed event (also the idempotency record)
  *   GSI LocationActivityIndex  PK: locationId, SK: activityAt -> "recent activity for a location"
  * LocationSummaryTable  PK: locationId   -> pre-aggregated counters (materialized view)
+ * HourlyStatsTable      PK: locationId, SK: hour (UTC, e.g. 2026-11-20T14) -> the same counters per hour, for trends
  */
 
 export const LOCATION_ACTIVITY_INDEX = 'LocationActivityIndex';
@@ -79,6 +81,13 @@ export interface LocationSummaryItem {
   connectivityChangedAt?: string;
 }
 
+export interface HourlyStatsItem extends CounterIncrements {
+  locationId: string;
+  /** UTC hour bucket, e.g. 2026-11-20T14. */
+  hour: string;
+  expiresAt: number;
+}
+
 export type PublicEvent = Omit<EventItem, 'expiresAt' | 'activityAt'>;
 
 /** What API consumers and event bus subscribers see: storage internals (TTL, index key) removed. */
@@ -89,6 +98,7 @@ export function toPublicEvent(item: EventItem): PublicEvent {
 
 const eventsTable = () => requireEnv('EVENTS_TABLE');
 const summaryTable = () => requireEnv('SUMMARY_TABLE');
+const hourlyStatsTable = () => requireEnv('HOURLY_STATS_TABLE');
 
 export function toEventItem(envelope: QueueEnvelope, now: Date): EventItem {
   const { event } = envelope;
@@ -124,15 +134,20 @@ export async function recordEvent(envelope: QueueEnvelope, now = new Date()): Pr
   }
 
   const increments = Object.entries(counterIncrementsFor(envelope.event));
-  const names: Record<string, string> = { '#lastUpdated': 'lastUpdated' };
-  const values: Record<string, unknown> = { ':now': now.toISOString() };
+  const counterNames: Record<string, string> = {};
+  const counterValues: Record<string, unknown> = {};
   const addClauses = increments.map(([counter, amount], i) => {
-    names[`#c${i}`] = counter;
-    values[`:c${i}`] = amount;
+    counterNames[`#c${i}`] = counter;
+    counterValues[`:c${i}`] = amount;
     return `#c${i} :c${i}`;
   });
 
-  // Both writes commit together or not at all. A fresh command per attempt keeps retries independent.
+  // The hour the event happened, by the same rule as recent activity: receipt time when the
+  // controller's clock is wrong. A backlog sent after an outage lands in the hours it happened.
+  const hour = hourOf(item.activityAt ?? item.receivedAt);
+  const hourExpiresAt = Math.floor(Date.parse(hourStart(hour)) / 1000) + EVENT_TTL_DAYS * DAY_SECONDS;
+
+  // All three writes commit together or not at all. A fresh command per attempt keeps retries independent.
   const transaction = () => new TransactWriteCommand({
     TransactItems: [
       {
@@ -149,8 +164,18 @@ export async function recordEvent(envelope: QueueEnvelope, now = new Date()): Pr
           TableName: summaryTable(),
           Key: { locationId: item.locationId },
           UpdateExpression: `ADD ${addClauses.join(', ')} SET #lastUpdated = :now`,
-          ExpressionAttributeNames: names,
-          ExpressionAttributeValues: values,
+          ExpressionAttributeNames: { ...counterNames, '#lastUpdated': 'lastUpdated' },
+          ExpressionAttributeValues: { ...counterValues, ':now': now.toISOString() },
+        },
+      },
+      {
+        // 3) The same increments in the site's bucket for that hour, kept as long as events are.
+        Update: {
+          TableName: hourlyStatsTable(),
+          Key: { locationId: item.locationId, hour },
+          UpdateExpression: `ADD ${addClauses.join(', ')} SET expiresAt = :expiresAt`,
+          ExpressionAttributeNames: counterNames,
+          ExpressionAttributeValues: { ...counterValues, ':expiresAt': hourExpiresAt },
         },
       },
     ],
@@ -318,6 +343,26 @@ export async function revertConnectivityChange(locationId: string, to: Connectiv
       ExpressionAttributeValues: { ':to': to, ':from': otherState(to) },
     }),
   );
+}
+
+/** A site's hourly buckets from `fromHour` on, oldest first. Hours without events have no item. */
+export async function listHourlyStats(locationId: string, fromHour: string): Promise<HourlyStatsItem[]> {
+  const items: HourlyStatsItem[] = [];
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const page = await getDynamoClient().send(
+      new QueryCommand({
+        TableName: hourlyStatsTable(),
+        KeyConditionExpression: 'locationId = :locationId AND #hour >= :from',
+        ExpressionAttributeNames: { '#hour': 'hour' }, // HOUR is a DynamoDB reserved word
+        ExpressionAttributeValues: { ':locationId': locationId, ':from': fromHour },
+        ExclusiveStartKey: startKey,
+      }),
+    );
+    items.push(...((page.Items ?? []) as HourlyStatsItem[]));
+    startKey = page.LastEvaluatedKey;
+  } while (startKey);
+  return items;
 }
 
 /** Most recent non-heartbeat events for a location, newest first (Query on the GSI, never a Scan). */

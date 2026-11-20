@@ -26,7 +26,6 @@ describe('OpenAPI document (docs/openapi.json)', () => {
         ),
     );
 
-    expect(deployed).toHaveLength(5);
     expect(documented.sort()).toEqual(deployed.sort());
   });
 

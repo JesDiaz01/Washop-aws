@@ -1,12 +1,13 @@
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { mockClient } from 'aws-sdk-client-mock';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   errorResponseSchema,
   locationListSchema,
   locationSummarySchema,
   processedEventSchema,
   recentEventsSchema,
+  trendSchema,
 } from '../src/api/responses';
 import { toEventItem } from '../src/aws/eventStore';
 import { washEventSchema } from '../src/domain/events';
@@ -108,6 +109,45 @@ describe('query handler', () => {
     expect(JSON.parse(response.body!)).toEqual({ message: 'Internal server error' });
   });
 
+  it('returns hourly counters in dollars for a window ending with the current hour', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T14:05:00Z'));
+    ddbMock.on(QueryCommand).resolves({
+      Items: [{ locationId: 'miami-01', hour: '2026-11-20T09', completedWashes: 3, washRevenueCents: 6600, expiresAt: 1 }],
+    });
+
+    const response = await get('GET /locations/{locationId}/trend', { locationId: 'miami-01' }, { query: { hours: '24' } });
+    vi.useRealTimers();
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body!)).toEqual({
+      locationId: 'miami-01',
+      from: '2026-11-19T15:00:00.000Z',
+      hours: [
+        {
+          hour: '2026-11-20T09:00:00.000Z',
+          washesStarted: 0,
+          completedWashes: 3,
+          revenue: 66,
+          paymentsCompleted: 0,
+          paymentVolume: 0,
+          equipmentFaults: 0,
+        },
+      ],
+    });
+    expect(ddbMock.commandCalls(QueryCommand)[0]!.args[0].input).toMatchObject({
+      TableName: 'test-hourly-stats',
+      ExpressionAttributeValues: { ':locationId': 'miami-01', ':from': '2026-11-19T15' },
+    });
+  });
+
+  it.each(['0', '721', '1.5', 'week'])('rejects hours=%s without reading DynamoDB', async (hours) => {
+    const response = await get('GET /locations/{locationId}/trend', { locationId: 'miami-01' }, { query: { hours } });
+
+    expect(response.statusCode).toBe(400);
+    expect(ddbMock.calls()).toHaveLength(0);
+  });
+
   it('rejects a malformed path value and an unknown route without reading DynamoDB', async () => {
     const badId = await get('GET /locations/{locationId}/summary', { locationId: 'miami 01; drop' });
     const unknown = await get('DELETE /locations/{locationId}', { locationId: 'miami-01' });
@@ -156,9 +196,9 @@ describe('query handler: site credentials read only their own site', () => {
   it("refuses another site's summary and activity without reading DynamoDB", async () => {
     const summary = await get('GET /locations/{locationId}/summary', { locationId: 'tampa-02' });
     const activity = await get('GET /locations/{locationId}/events', { locationId: 'tampa-02' });
+    const trend = await get('GET /locations/{locationId}/trend', { locationId: 'tampa-02' });
 
-    expect(summary.statusCode).toBe(403);
-    expect(activity.statusCode).toBe(403);
+    expect([summary.statusCode, activity.statusCode, trend.statusCode]).toEqual([403, 403, 403]);
     expect(ddbMock.calls()).toHaveLength(0);
   });
 
@@ -185,14 +225,17 @@ describe('query handler: site credentials read only their own site', () => {
 
 describe('query handler: responses match the published contract (docs/openapi.json)', () => {
   // Realistic stored items, so every documented field is present and checked.
-  const summaryItem = {
-    locationId: 'miami-01',
+  const summaryCounters = {
     washesStarted: 3,
     completedWashes: 2,
     washRevenueCents: 4400,
     paymentsCompleted: 2,
     paymentVolumeCents: 4400,
     equipmentFaults: 1,
+  };
+  const summaryItem = {
+    locationId: 'miami-01',
+    ...summaryCounters,
     lastHeartbeat: '2026-09-14T18:31:00.000Z',
     controllerClockSkewSeconds: -2,
     connectivity: 'OFFLINE',
@@ -222,6 +265,10 @@ describe('query handler: responses match the published contract (docs/openapi.js
 
     ddbMock.on(GetCommand).resolves({ Item: storedEvent() });
     processedEventSchema.parse(body(await get('GET /events/{eventId}', { eventId: 'evt-1001' })));
+
+    ddbMock.on(QueryCommand).resolves({ Items: [{ locationId: 'miami-01', hour: '2026-09-14T18', ...summaryCounters }] });
+    const trend = trendSchema.parse(body(await get('GET /locations/{locationId}/trend', { locationId: 'miami-01' })));
+    expect(trend.hours).toHaveLength(1);
   });
 
   it('error bodies parse with the Error schema', async () => {

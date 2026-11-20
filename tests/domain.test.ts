@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { describeSkew, isClockSuspect } from '../src/domain/clock';
 import { connectivityChangeFor, reportedConnectivity } from '../src/domain/connectivity';
 import { toValidationIssues, washEventSchema } from '../src/domain/events';
+import { firstHourOfWindow, hourOf, hourStart } from '../src/domain/hours';
 import { boundSites, canSendFor } from '../src/domain/siteAccess';
 import { counterIncrementsFor, toCents } from '../src/domain/summary';
 import { heartbeatPayload, washCompletedPayload } from './fixtures';
@@ -138,6 +139,22 @@ describe('reportedConnectivity', () => {
     ],
   ] as const)('%s', (_label, site, expected) => {
     expect(reportedConnectivity(site)).toBe(expected);
+  });
+});
+
+describe('hour buckets', () => {
+  it('buckets by UTC hour, whatever offset the timestamp had', () => {
+    expect(hourOf('2026-09-14T18:59:59.999Z')).toBe('2026-09-14T18');
+    expect(hourOf('2026-09-14T14:30:00-04:00')).toBe('2026-09-14T18');
+    expect(hourStart('2026-09-14T18')).toBe('2026-09-14T18:00:00.000Z');
+  });
+
+  it('starts a window of N hours so that it ends with the current hour', () => {
+    const now = new Date('2026-11-20T14:05:00Z');
+
+    expect(firstHourOfWindow(now, 1)).toBe('2026-11-20T14');
+    expect(firstHourOfWindow(now, 24)).toBe('2026-11-19T15');
+    expect(firstHourOfWindow(now, 168)).toBe('2026-11-13T15');
   });
 });
 

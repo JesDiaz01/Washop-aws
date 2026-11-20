@@ -96,6 +96,23 @@ describe(`deployed API (${process.env.WASHOPS_STACK ?? 'washops-dev'})`, () => {
     expect(await completedWashes()).toBe(before + 1);
   });
 
+  it('counts a wash in the trend for the hour it happened', async () => {
+    const body = washCompleted(`it-${run}-trend`);
+    const hour = `${body.timestamp.slice(0, 13)}:00:00.000Z`;
+    const washesInHour = async () => {
+      const response = await get(`/locations/${site.locationId}/trend?hours=2`);
+      expect(response.status).toBe(200);
+      const bucket = (response.body.hours as { hour: string; completedWashes: number }[]).find((h) => h.hour === hour);
+      return bucket?.completedWashes ?? 0;
+    };
+    const before = await washesInHour();
+
+    expect((await post(body)).status).toBe(202);
+    await processedEvent(body.eventId);
+
+    expect(await washesInHour()).toBe(before + 1);
+  });
+
   it('accepts an event from a wrong clock, warns, and flags it', async () => {
     const eventId = `it-${run}-future`;
 

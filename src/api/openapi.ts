@@ -11,10 +11,12 @@ import {
 import {
   errorResponseSchema,
   eventAcceptedSchema,
+  hourlyStatsSchema,
   locationListSchema,
   locationSummarySchema,
   processedEventSchema,
   recentEventsSchema,
+  trendSchema,
 } from './responses';
 
 /**
@@ -172,6 +174,31 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      '/locations/{locationId}/trend': {
+        get: {
+          operationId: 'getLocationTrend',
+          summary: "A site's counters per hour, for trend charts",
+          description:
+            'Hours are UTC, so a client can add them up into days in any time zone. Kept for 90 days.',
+          security: read,
+          parameters: [
+            locationIdParam,
+            {
+              name: 'hours',
+              in: 'query',
+              required: false,
+              description: 'How many hours, ending with the current one',
+              schema: { type: 'integer', minimum: 1, maximum: 720, default: 168 },
+            },
+          ],
+          responses: {
+            200: response('Hourly counters', ref('Trend')),
+            400: response('Invalid locationId or hours'),
+            ...common,
+            403: response("This credential may not read the site's data"),
+          },
+        },
+      },
       '/events/{eventId}': {
         get: {
           operationId: 'getEvent',
@@ -221,6 +248,8 @@ export function buildOpenApiDocument() {
             LocationList: locationListSchema,
             ProcessedEvent: processedEventSchema,
             RecentEvents: recentEventsSchema,
+            HourlyStats: hourlyStatsSchema,
+            Trend: trendSchema,
             Error: errorResponseSchema,
           },
           'output',

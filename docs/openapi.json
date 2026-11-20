@@ -399,6 +399,105 @@
         }
       }
     },
+    "/locations/{locationId}/trend": {
+      "get": {
+        "operationId": "getLocationTrend",
+        "summary": "A site's counters per hour, for trend charts",
+        "description": "Hours are UTC, so a client can add them up into days in any time zone. Kept for 90 days.",
+        "security": [
+          {
+            "cognito": [
+              "washops/events.read"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "name": "locationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]{2,64}$"
+            }
+          },
+          {
+            "name": "hours",
+            "in": "query",
+            "required": false,
+            "description": "How many hours, ending with the current one",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 720,
+              "default": 168
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hourly counters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Trend"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid locationId or hours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, expired, or invalid access token (rejected by API Gateway before any Lambda runs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This credential may not read the site's data",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Throttled: more than 25 requests/s (burst 50) across the API",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server error; details are only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/events/{eventId}": {
       "get": {
         "operationId": "getEvent",
@@ -1018,6 +1117,75 @@
           "locationId",
           "count",
           "events"
+        ]
+      },
+      "HourlyStats": {
+        "type": "object",
+        "properties": {
+          "hour": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the hour, UTC"
+          },
+          "washesStarted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completedWashes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "revenue": {
+            "type": "number",
+            "description": "Dollars, converted from the integer cents stored"
+          },
+          "paymentsCompleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "paymentVolume": {
+            "type": "number",
+            "description": "Dollars, converted from the integer cents stored"
+          },
+          "equipmentFaults": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "hour",
+          "washesStarted",
+          "completedWashes",
+          "revenue",
+          "paymentsCompleted",
+          "paymentVolume",
+          "equipmentFaults"
+        ]
+      },
+      "Trend": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{2,64}$"
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Start of the first hour covered (UTC); the window ends with the current hour"
+          },
+          "hours": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HourlyStats"
+            },
+            "description": "Oldest first. Hours without events are omitted. Each event counts in the hour it happened, or the hour it was received if the controller's clock was wrong."
+          }
+        },
+        "required": [
+          "locationId",
+          "from",
+          "hours"
         ]
       },
       "Error": {

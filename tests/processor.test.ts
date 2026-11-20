@@ -39,6 +39,30 @@ describe('processor handler (SQS consumer)', () => {
     expect(update!.Update!.ExpressionAttributeValues).toMatchObject({ ':c0': 1, ':c1': 2200 });
   });
 
+  it('counts the same increments in the hour the event happened, in the same transaction', async () => {
+    await handler(sqsEvent([messageFor(washCompletedPayload())]), lambdaContext); // 2026-09-14T18:30:00Z
+
+    const [, , hourly] = ddbMock.commandCalls(TransactWriteCommand)[0]!.args[0].input.TransactItems!;
+    expect(hourly!.Update).toEqual({
+      TableName: 'test-hourly-stats',
+      Key: { locationId: 'miami-01', hour: '2026-09-14T18' },
+      UpdateExpression: 'ADD #c0 :c0, #c1 :c1 SET expiresAt = :expiresAt',
+      // Only names the expression uses: DynamoDB rejects unused ones.
+      ExpressionAttributeNames: { '#c0': 'completedWashes', '#c1': 'washRevenueCents' },
+      ExpressionAttributeValues: { ':c0': 1, ':c1': 2200, ':expiresAt': Date.parse('2026-12-13T18:00:00Z') / 1000 },
+    });
+  });
+
+  it.each([
+    ['a backlog after an outage counts in the hours it happened', '2026-09-12T09:15:00Z', '2026-09-12T09'],
+    ["a wrong clock's event counts in the hour it was received", '2019-01-01T00:00:00Z', '2026-09-14T18'],
+  ])('%s', async (_label, timestamp, expectedHour) => {
+    await handler(sqsEvent([messageFor(washCompletedPayload({ timestamp }))]), lambdaContext);
+
+    const [, , hourly] = ddbMock.commandCalls(TransactWriteCommand)[0]!.args[0].input.TransactItems!;
+    expect(hourly!.Update!.Key).toEqual({ locationId: 'miami-01', hour: expectedHour });
+  });
+
   it('treats a duplicate delivery as success without double counting', async () => {
     // What DynamoDB returns when the idempotency condition (item 0) fails.
     ddbMock.on(TransactWriteCommand).rejects(

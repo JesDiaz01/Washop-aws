@@ -75,7 +75,28 @@ export const recentEventsSchema = z.strictObject({
   events: z.array(processedEventSchema).meta({ description: 'Newest first; heartbeats are not listed' }),
 });
 
+export const hourlyStatsSchema = z.strictObject({
+  hour: timestamp.meta({ description: 'Start of the hour, UTC' }),
+  washesStarted: count,
+  completedWashes: count,
+  revenue: dollars,
+  paymentsCompleted: count,
+  paymentVolume: dollars,
+  equipmentFaults: count,
+});
+
+export const trendSchema = z.strictObject({
+  locationId: locationIdSchema,
+  from: timestamp.meta({ description: 'Start of the first hour covered (UTC); the window ends with the current hour' }),
+  hours: z.array(hourlyStatsSchema).meta({
+    description:
+      'Oldest first. Hours without events are omitted. Each event counts in the hour it happened, or the hour it ' +
+      "was received if the controller's clock was wrong.",
+  }),
+});
+
 export type EventAcceptedResponse = z.infer<typeof eventAcceptedSchema>;
+export type TrendResponse = z.infer<typeof trendSchema>;
 export type LocationSummaryResponse = z.infer<typeof locationSummarySchema>;
 export type LocationListResponse = z.infer<typeof locationListSchema>;
 export type RecentEventsResponse = z.infer<typeof recentEventsSchema>;
