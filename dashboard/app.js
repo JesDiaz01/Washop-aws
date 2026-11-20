@@ -318,7 +318,7 @@ function describeEvent(event) {
 
 function renderActivity(locationId, events) {
   $('activity').hidden = false;
-  $('activity-title').textContent = `Recent activity at ${locationId}`;
+  $('activity-title').textContent = locationId;
   $('no-activity').hidden = events.length > 0;
   $('activity-rows').replaceChildren(
     ...events.map((event) => {
@@ -343,6 +343,193 @@ function renderActivity(locationId, events) {
 }
 
 // ---------------------------------------------------------------------------
+// Trend chart: wash revenue per day in the viewer's time zone, from the API's UTC hours
+// ---------------------------------------------------------------------------
+
+const TREND_DAYS = 7;
+const HOUR_MS = 3_600_000;
+const wholeDollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+const weekday = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const longDay = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+const pad = (n) => String(n).padStart(2, '0');
+const localDayKey = (date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+
+/** Local midnight that starts the window: today and the six days before it. */
+function trendStart(now) {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (TREND_DAYS - 1));
+  return start;
+}
+
+/** How many hours to ask for, so the API's window (ending with the current hour) covers every day shown. */
+const trendHours = (now = new Date()) => Math.min(720, Math.ceil((now - trendStart(now)) / HOUR_MS) + 1);
+
+/** Adds the API's UTC hours up into local days, so each day ends at the viewer's midnight. */
+function dailyTotals(hours, now = new Date()) {
+  const start = trendStart(now);
+  const days = Array.from({ length: TREND_DAYS }, (_, i) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + i);
+    return { key: localDayKey(date), date, revenue: 0, washes: 0, isToday: i === TREND_DAYS - 1 };
+  });
+  const byKey = new Map(days.map((day) => [day.key, day]));
+  for (const hour of hours) {
+    const day = byKey.get(localDayKey(new Date(hour.hour)));
+    if (!day) continue;
+    day.revenue += hour.revenue;
+    day.washes += hour.completedWashes;
+  }
+  for (const day of days) day.revenue = Math.round(day.revenue * 100) / 100; // dollars added up from cents
+  return days;
+}
+
+const dayTitle = (day) => (day.isToday ? `Today so far (${longDay.format(day.date)})` : longDay.format(day.date));
+const washCount = (n) => `${count.format(n)} completed ${n === 1 ? 'wash' : 'washes'}`;
+
+/** About three clean steps from zero to at least the maximum (1, 2, 2.5, or 5 times a power of ten). */
+function niceTicks(max) {
+  const rough = max / 3;
+  const magnitude = 10 ** Math.floor(Math.log10(rough));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= rough);
+  const ticks = [];
+  for (let i = 0; ; i += 1) {
+    ticks.push(i * step);
+    if (i * step >= max) return { ticks, step };
+  }
+}
+
+function svgEl(tag, attributes = {}, text) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [name, value] of Object.entries(attributes)) node.setAttribute(name, String(value));
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+/** A column with a 4px rounded top, square on the baseline. */
+function columnPath(x, y, width, height) {
+  const r = Math.min(4, height, width / 2);
+  const bottom = y + height;
+  return `M${x},${bottom}V${y + r}Q${x},${y} ${x + r},${y}H${x + width - r}Q${x + width},${y} ${x + width},${y + r}V${bottom}Z`;
+}
+
+let lastTrend;
+let renderedWidth = 0;
+
+function hideTooltip() {
+  $('trend-tooltip').hidden = true;
+  for (const hit of $('trend-chart').querySelectorAll('.hit.active')) hit.classList.remove('active');
+}
+
+function showTooltip(day, hit, x, top, chartWidth) {
+  hideTooltip();
+  const tooltip = $('trend-tooltip');
+  tooltip.replaceChildren(
+    el('div', { className: 'muted', text: dayTitle(day) }),
+    el('div', { className: 'tooltip-value' }, [el('span', { className: 'tooltip-key' }), el('span', { text: money.format(day.revenue) })]),
+    el('div', { text: washCount(day.washes) }),
+  );
+  tooltip.style.left = `${Math.min(Math.max(x, 80), chartWidth - 80)}px`; // keep it inside the panel
+  tooltip.style.top = `${top}px`;
+  tooltip.hidden = false;
+  hit.classList.add('active');
+}
+
+function renderTrend(trend) {
+  lastTrend = trend;
+  const days = dailyTotals(trend.hours);
+  const total = days.reduce((sum, day) => sum + day.revenue, 0);
+  const washes = days.reduce((sum, day) => sum + day.washes, 0);
+
+  $('trend-total').textContent = `${money.format(total)} from ${washCount(washes)}`;
+  $('trend-rows').replaceChildren(
+    ...days.map((day) =>
+      el('tr', {}, [
+        el('td', { className: 'nowrap', text: dayTitle(day) }),
+        el('td', { className: 'num', text: count.format(day.washes) }),
+        el('td', { className: 'num', text: money.format(day.revenue) }),
+      ]),
+    ),
+  );
+
+  const chart = $('trend-chart');
+  chart.querySelector('svg')?.remove();
+  hideTooltip();
+  $('no-trend').hidden = total > 0;
+  renderedWidth = chart.clientWidth;
+  if (total === 0 || renderedWidth === 0) return;
+
+  const width = renderedWidth;
+  const height = 200;
+  const margin = { top: 20, right: 8, bottom: 28, left: 56 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const baseline = margin.top + plotHeight;
+
+  const max = Math.max(...days.map((day) => day.revenue));
+  const { ticks, step } = niceTicks(max);
+  const scaleTop = ticks.at(-1);
+  const y = (value) => baseline - (value / scaleTop) * plotHeight;
+  const tickFormat = step < 1 ? money : scaleTop >= 10_000 ? compactMoney : wholeDollars;
+  const crisp = (value) => Math.round(value) + 0.5; // 1px lines on the pixel grid
+
+  const band = plotWidth / days.length;
+  const barWidth = Math.min(24, band * 0.6);
+  const best = days.reduce((a, b) => (b.revenue > a.revenue ? b : a));
+
+  const svg = svgEl('svg', {
+    viewBox: `0 0 ${width} ${height}`,
+    role: 'group',
+    'aria-label': `Wash revenue per day, last ${TREND_DAYS} days: ${money.format(total)} in total`,
+  });
+
+  for (const tick of ticks) {
+    if (tick > 0) svg.append(svgEl('line', { class: 'grid', x1: margin.left, x2: width - margin.right, y1: crisp(y(tick)), y2: crisp(y(tick)) }));
+    svg.append(svgEl('text', { class: 'tick', x: margin.left - 8, y: y(tick), 'text-anchor': 'end', 'dominant-baseline': 'middle' }, tickFormat.format(tick)));
+  }
+
+  days.forEach((day, i) => {
+    const left = margin.left + i * band;
+    const center = left + band / 2;
+    const barTop = y(day.revenue);
+
+    // The whole day's band is the hover and focus target, bigger than the bar itself.
+    const hit = svgEl('rect', {
+      class: 'hit',
+      x: left + 2,
+      y: margin.top - 8,
+      width: band - 4,
+      height: plotHeight + 8,
+      rx: 6,
+      tabindex: 0,
+      role: 'img',
+      'aria-label': `${dayTitle(day)}: ${money.format(day.revenue)} from ${washCount(day.washes)}`,
+    });
+    const show = () => showTooltip(day, hit, center, Math.min(barTop, baseline - 4), width);
+    hit.addEventListener('pointerenter', show);
+    hit.addEventListener('focus', show);
+    hit.addEventListener('pointerleave', hideTooltip);
+    hit.addEventListener('blur', hideTooltip);
+    svg.append(hit);
+
+    if (day.revenue > 0) {
+      svg.append(svgEl('path', { class: 'bar', d: columnPath(center - barWidth / 2, barTop, barWidth, baseline - barTop) }));
+    }
+    const label = day.isToday ? 'Today' : band >= 56 ? `${weekday.format(day.date)} ${day.date.getDate()}` : weekday.format(day.date);
+    svg.append(svgEl('text', { class: 'tick', x: center, y: height - 8, 'text-anchor': 'middle' }, label));
+  });
+
+  // One direct label, on the extreme: the best day's value on its cap. The tooltip and table carry the rest.
+  const bestCenter = margin.left + days.indexOf(best) * band + band / 2;
+  svg.append(
+    svgEl('text', { class: 'cap-label', x: bestCenter, y: y(best.revenue) - 6, 'text-anchor': 'middle' }, (best.revenue >= 10_000 ? compactMoney : wholeDollars).format(best.revenue)),
+  );
+  svg.append(svgEl('line', { class: 'baseline', x1: margin.left, x2: width - margin.right, y1: crisp(baseline), y2: crisp(baseline) }));
+
+  chart.prepend(svg);
+}
+
+// ---------------------------------------------------------------------------
 // Screens
 // ---------------------------------------------------------------------------
 
@@ -364,8 +551,13 @@ async function refresh() {
     renderKpis(locations);
     renderSites(locations);
     if (selectedSite) {
-      const { events } = await api(`/locations/${encodeURIComponent(selectedSite)}/events?limit=20`);
-      renderActivity(selectedSite, events);
+      const site = encodeURIComponent(selectedSite);
+      const [{ events }, trend] = await Promise.all([
+        api(`/locations/${site}/events?limit=20`),
+        api(`/locations/${site}/trend?hours=${trendHours()}`),
+      ]);
+      renderActivity(selectedSite, events); // shows the panel first, so the chart can measure its width
+      renderTrend(trend);
     }
     $('updated').textContent = `Updated ${clock.format(new Date())}`;
     showError('');
@@ -397,9 +589,14 @@ async function start() {
   $('refresh').addEventListener('click', refresh);
   $('close-activity').addEventListener('click', () => {
     selectedSite = undefined;
+    lastTrend = undefined;
     $('activity').hidden = true;
     refresh();
   });
+  // Redraw at the new width (rotating a phone, resizing the window) so text stays its real size.
+  new ResizeObserver(() => {
+    if (lastTrend && $('trend-chart').clientWidth !== renderedWidth) renderTrend(lastTrend);
+  }).observe($('trend-chart'));
 
   try {
     const response = await fetch('config.json', { cache: 'no-store' });

@@ -62,9 +62,38 @@
 
         <section class="panel" id="activity" hidden>
           <div class="toolbar">
-            <h2 id="activity-title">Recent activity</h2>
+            <h2 id="activity-title">Site</h2>
             <button class="button button-quiet" id="close-activity" type="button">Close</button>
           </div>
+
+          <div class="trend">
+            <div class="trend-head">
+              <h3>Wash revenue, last 7 days</h3>
+              <span class="muted" id="trend-total"></span>
+            </div>
+            <div class="chart" id="trend-chart">
+              <div class="chart-tooltip" id="trend-tooltip" hidden></div>
+            </div>
+            <p class="empty muted" id="no-trend" hidden>No wash revenue in the last 7 days.</p>
+            <details class="chart-table">
+              <summary>Show as table</summary>
+              <div class="table-scroll">
+                <table class="data-table">
+                  <caption class="visually-hidden">Completed washes and wash revenue per day, last 7 days</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Day</th>
+                      <th scope="col" class="num">Completed washes</th>
+                      <th scope="col" class="num">Wash revenue</th>
+                    </tr>
+                  </thead>
+                  <tbody id="trend-rows"></tbody>
+                </table>
+              </div>
+            </details>
+          </div>
+
+          <h3>Recent activity</h3>
           <div class="table-scroll">
             <table class="data-table">
               <caption class="visually-hidden">The site's most recent events, newest first</caption>

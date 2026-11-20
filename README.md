@@ -6,7 +6,7 @@ An event-driven integration layer on AWS that ingests operational events from ca
 
 Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cognito**, **SQS + dead-letter queue**, **S3**, **DynamoDB (+ Streams)**, **EventBridge (bus, rules, Scheduler)**, **CloudWatch**, **X-Ray**, **CodeDeploy**, **Athena**, **CloudFront**, and **IAM**, defined entirely as infrastructure as code with **AWS SAM**.
 
-> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 97 unit tests (97% line coverage) in CI, an [OpenAPI contract](docs/openapi.json) generated from the validation schemas, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
+> **Status:** deployed to AWS (us-east-1) and verified end to end, with 9 integration tests passing against the live stack, 107 unit tests (97% line coverage) in CI, an [OpenAPI contract](docs/openapi.json) generated from the validation schemas, and a [load test](#load-test). [Deployment status](#deployment-status) lists the evidence for each feature; ideas not yet built are under [future improvements](#future-production-improvements).
 
 ![The WashOps operations dashboard: site KPIs, a site online, and recent activity including an equipment fault and an event flagged for a controller clock running 2 hours fast](docs/dashboard.png)
 
@@ -19,7 +19,7 @@ Built with **TypeScript**, **AWS Lambda (Node.js 22)**, **API Gateway**, **Cogni
 - **Each site can only touch its own data.** Cognito tokens are bound to one site for both sending and reading; people sign in to the dashboard with PKCE.
 - **It notices silence and bad clocks.** A scheduled monitor emails once when a site stops sending heartbeats and once when it's back; events from controllers with wrong clocks are accepted but flagged.
 - **Other systems can build on it.** Processed events fan out on an EventBridge bus, and Athena queries the raw archive in place.
-- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 97 unit tests and 9 integration tests against the live stack.
+- **All infrastructure as code, verified in AWS.** One SAM template, dev and prod stacks, a least-privilege IAM role per function, 107 unit tests and 9 integration tests against the live stack.
 
 ---
 
@@ -79,7 +79,7 @@ flowchart LR
     ING -->|"SendMessage"| Q[["SQS<br/>events queue"]]
     Q -->|"batches of 10"| PROC["Lambda<br/>processor"]
     Q -.->|"after 5 failed receives"| DLQ[["SQS<br/>dead-letter queue"]]
-    PROC -->|"TransactWriteItems"| DDB[("DynamoDB<br/>EventsTable<br/>LocationSummaryTable")]
+    PROC -->|"TransactWriteItems"| DDB[("DynamoDB<br/>EventsTable<br/>LocationSummaryTable<br/>HourlyStatsTable")]
     DDB -->|"stream: new items"| PUB["Lambda<br/>event publisher"]
     PUB --> EB{{"EventBridge bus"}}
     EB -->|"HIGH/CRITICAL faults"| ALERTS["SNS<br/>site alerts"]
@@ -204,11 +204,12 @@ WashOps makes processing safe to repeat:
 
 ```text
 TransactWriteItems (all-or-nothing)
- ├─ Put    EventsTable[eventId]           IF attribute_not_exists(eventId)   ← idempotency record
- └─ Update LocationSummaryTable[location] ADD completedWashes 1, washRevenueCents 2200
+ ├─ Put    EventsTable[eventId]                 IF attribute_not_exists(eventId)   ← idempotency record
+ ├─ Update LocationSummaryTable[location]       ADD completedWashes 1, washRevenueCents 2200
+ └─ Update HourlyStatsTable[location, hour]     ADD completedWashes 1, washRevenueCents 2200   ← trends
 ```
 
-- The **event record and the counter increment commit atomically.** Writing them separately would open a window where a crash either loses the increment or double-counts on retry.
+- The **event record and the counter increments commit atomically.** Writing them separately would open a window where a crash either loses the increment or double-counts on retry.
 - If the `eventId` already exists, DynamoDB cancels the transaction with `ConditionalCheckFailed` on item 0. The processor treats that as success (`DUPLICATE`) so SQS deletes the message instead of retrying it.
 - **Heartbeats take a different path on purpose.** "Move `lastHeartbeat` forward to T" is *naturally* idempotent, so it uses a single conditional update (`lastHeartbeat < :ts`). That also prevents an out-of-order, older heartbeat from moving the value backwards, since standard SQS does not guarantee ordering. T is the server's receipt time, so a controller's wrong clock can't affect liveness. The heartbeat's own record may replace only an earlier copy of itself: a heartbeat that reuses another event's ID is dropped, so it can never overwrite a wash or payment record, even one from another site.
 - Money is stored as **integer cents** (`19.99 * 100 === 1998.9999999999998` in JavaScript).
@@ -293,10 +294,11 @@ Roles are declared explicitly in `template.yaml` rather than using SAM's generat
 | | `sqs:SendMessage` | the events queue |
 | `ProcessorFunctionRole` | `logs:CreateLogStream`, `logs:PutLogEvents` | its own log group |
 | | `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes` | the events queue (used by the event source mapping) |
-| | `dynamodb:PutItem`, `dynamodb:UpdateItem` | the two tables (authorizes the transaction's operations) |
+| | `dynamodb:PutItem`, `dynamodb:UpdateItem` | `EventsTable`, `LocationSummaryTable` (authorizes the transaction's operations) |
+| | `dynamodb:UpdateItem` | `HourlyStatsTable` |
 | `QueryFunctionRole` | `logs:CreateLogStream`, `logs:PutLogEvents` | its own log group |
-| | `dynamodb:GetItem` | the two tables |
-| | `dynamodb:Query` | `EventsTable/index/LocationActivityIndex` only |
+| | `dynamodb:GetItem` | `EventsTable`, `LocationSummaryTable` |
+| | `dynamodb:Query` | `EventsTable/index/LocationActivityIndex` and `HourlyStatsTable` only |
 | | `dynamodb:Scan` | `LocationSummaryTable` (`GET /locations`) |
 | `SiteMonitorFunctionRole` | `logs:*` (own group only), `dynamodb:Scan`, `dynamodb:UpdateItem` | `LocationSummaryTable` |
 | | `sns:Publish` | the site alerts topic |
@@ -331,14 +333,16 @@ DynamoDB tables are designed around access patterns, not normalization:
 | Get a location's current summary | `GetItem` on `LocationSummaryTable` (counters maintained at write time, a materialized view) |
 | Latest activity for a location, newest first | `Query` GSI `LocationActivityIndex` (PK `locationId`, SK `activityAt`), `ScanIndexForward=false` |
 | All sites (dashboard, site monitor) | `Scan` on `LocationSummaryTable`: one small item per site, paginated |
+| A site's trend: counters per hour | `Query` on `HourlyStatsTable` (PK `locationId`, SK `hour`, e.g. `2026-11-20T14`) from the window's first hour |
 | React to newly recorded events | `EventsTable` stream (`NEW_IMAGE`) |
 
 - **Sparse index:** heartbeat items omit `activityAt`, so they never enter the GSI. A controller pinging every minute doesn't bury real activity.
 - **TTL:** `expiresAt` auto-deletes event items (90 days; 7 for heartbeats) at no cost. Summaries are kept.
 - **Revenue rule:** wash revenue is recognized on `WASH_COMPLETED`. `PAYMENT_COMPLETED` is tracked separately (`paymentsCompleted`, `paymentVolume`) so money is never counted twice.
+- **Trends:** each event's increments also go to its site's bucket for the **UTC hour** it happened (the hour it was received, if the controller's clock is wrong), in the same transaction, so trends and totals never disagree. Hours rather than days because a business day depends on the site's time zone: the dashboard adds hours up into days in the viewer's zone. Buckets expire after 90 days, like events. A backlog sent after an outage lands in the hours it happened.
 - **Connectivity:** the site monitor adds `connectivity` and `connectivityChangedAt` to summary items.
 - **Clocks:** `lastHeartbeat` is server receipt time; `controllerClockSkewSeconds` on the summary is the controller's clock error at that heartbeat. An event from a wrong clock gets `clockSkewSeconds`, and its `activityAt` (the index sort key) is `receivedAt` instead of the controller's timestamp.
-- **Protection:** both tables have point-in-time recovery. In prod they have `DeletionPolicy: Retain`, so they survive a stack delete or an accidental replacement; dev deletes them (see [Environments](#environments)).
+- **Protection:** all three tables have point-in-time recovery. In prod they have `DeletionPolicy: Retain`, so they survive a stack delete or an accidental replacement; dev deletes them (see [Environments](#environments)).
 
 S3 keys use Hive-style partitions, which Athena reads directly:
 
@@ -451,8 +455,9 @@ A static web page (`dashboard/`, plain HTML/CSS/JS, no build step) served from a
 
 - KPI tiles: sites, offline now, completed washes, wash revenue, equipment faults
 - every site with its connectivity (icon + label), totals, and last heartbeat
-- recent activity for a selected site, with fault severity
+- for a selected site: wash revenue for the last 7 days (a column chart in the viewer's time zone, with a hover and keyboard tooltip and a table view), and recent activity with fault severity
 - refreshes every 30 seconds while the tab is visible
+- light and dark themes; chart colors are checked against both surfaces for contrast and color-vision safety
 
 People sign in on Cognito's hosted page; the page then calls the API's `GET` routes with the access token. It has read-only scope: it can't send events. Publishing and inviting users are covered under [AWS deployment](#aws-deployment).
 
@@ -540,7 +545,7 @@ Development here is unit-test-first against mocked SDK clients, followed by depl
 
 ### Unit tests
 
-Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 97 tests across 8 files.
+Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikowski/aws-sdk-client-mock), which intercepts AWS SDK v3 `send()` calls. The real handler code runs, with no AWS access needed. 107 tests across 8 files.
 
 `npm run test:coverage` reports coverage of `src/`: 97% of lines and 88% of branches. CI fails below 95% of lines, statements, and functions or 85% of branches, so new code arrives with its tests.
 
@@ -548,9 +553,9 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 |---|---|
 | Validation | Valid events; missing/unsafe IDs; non-ISO timestamps; negative and sub-cent amounts; unsupported `eventType` message; UTC normalization; unknown fields stripped |
 | Ingestion | `202` with S3 key format and SQS envelope; correlation ID propagation; caller's client ID recorded in the archive; `403` and nothing stored for a credential bound to another site; wrong-clock warning (and none when the clock is fine); `400` touches no AWS resources; malformed JSON and empty body; `413` over 64 KB with nothing stored; site binding read from the raw `scope` claim when API Gateway passes no scope list; S3 failure returns `500` and does not enqueue |
-| Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents); duplicate delivery treated as success; a transaction conflict retried in process, and given back to SQS if it persists; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
-| Clocks and site access | Backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
-| Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; own event returned without storage fields; `404` for unprocessed events; `400`/`404` for a bad path value or unknown route without a DynamoDB read; generic `500` that doesn't leak the DynamoDB error; GSI query newest-first; `limit` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
+| Processing | `WASH_COMPLETED` → one transaction with conditional put and correct counter increments (cents), plus the same increments in the event's UTC hour bucket (a backlog in the hours it happened, a wrong clock's event in the hour received); duplicate delivery treated as success; a transaction conflict retried in process, and given back to SQS if it persists; DynamoDB throttling fails only that message; poison messages reported without blocking the batch; wrong-clock event flagged and sorted by receipt time; heartbeat liveness in server time with the clock error recorded; stale heartbeat ignored and heartbeats excluded from the GSI |
+| Clocks and site access | UTC hour buckets and trend windows; backlog vs. future vs. 2019 timestamps; heartbeat tolerance both ways; skew wording; site scopes with no prefix tricks |
+| Query | Cents → dollars mapping; connectivity in summaries, `ONLINE` as soon as a heartbeat follows an `OFFLINE` mark; `GET /locations` sorted with connectivity; own event returned without storage fields; `404` for unprocessed events; `400`/`404` for a bad path value or unknown route without a DynamoDB read; generic `500` that doesn't leak the DynamoDB error; GSI query newest-first; `limit` validation; trend window ending with the current hour, in dollars, with `hours` validation; site credentials read only their own site (`403` without a DynamoDB read, `404` for another site's event, no access gained by dropping the site scope) |
 | Site monitor | Silent site → one offline alert with a race-safe condition; recovery alert; no alert for healthy, still-offline, or never-reporting sites; no alert when another run already recorded the change; failed alert reverts and fails the run; paginated scan; threshold edge cases |
 | Event publisher | New events published with type as `detail-type` and storage fields removed; heartbeats, updates, and TTL deletes skipped; only rejected entries retried; whole-chunk retry when the call fails; batches split at 10 entries |
 | Replay | Requeue once per event with original correlation ID; SQS batches of 10, refused entries resent and reported; stops before the time limit with a resume key; days outside the duplicate window refused; invalid archived payloads skipped; dry run; republish with not-found reporting; malformed request rejected before touching AWS |
@@ -568,6 +573,7 @@ Unit tests use Vitest and [`aws-sdk-client-mock`](https://github.com/m-radzikows
 | Event for another site → `403` | Site binding |
 | Valid event → `202`, then `GET /events/{id}` returns it with the archive key | The whole pipeline, end to end |
 | Same event twice → `completedWashes` goes up by exactly 1 | Idempotency in DynamoDB |
+| A wash → its hour's bucket in `GET /locations/{id}/trend` goes up by 1 | Hourly trends, written in the same transaction |
 | Timestamp 2 h ahead → `202` with a warning, stored with `clockSkewSeconds` | Clock flagging |
 | Heartbeat 1 h behind → site still alive, clock error recorded; then a correct heartbeat clears it | Liveness in server time |
 | `GET /locations` lists only the credential's own site | The read path, scoped to the site |
@@ -899,6 +905,21 @@ HTTP 200
 `processedAt` minus `receivedAt` is the asynchronous hop: here 91 ms from API receipt, through SQS, to the DynamoDB write. An event from a controller with a wrong clock also carries `clockSkewSeconds` (`"occurredAt": "2026-11-09T21:32:00.459Z"`, `"receivedAt": "2026-11-09T19:32:06.091Z"`, `"clockSkewSeconds": 7194`).
 
 Returns `404` if the event has not been processed, including an event that was accepted and is still on the queue.
+
+### `GET /locations/{locationId}/trend?hours=168`
+
+A site's counters per UTC hour, for the window ending with the current hour (`hours` 1–720, default 168 = 7 days). Hours without events are omitted. Clients add the hours up into days in their own time zone.
+
+```json
+HTTP 200
+{
+  "locationId": "miami-01",
+  "from": "2026-11-13T15:00:00.000Z",
+  "hours": [
+    { "hour": "2026-11-20T13:00:00.000Z", "washesStarted": 6, "completedWashes": 6, "revenue": 129, "paymentsCompleted": 6, "paymentVolume": 129, "equipmentFaults": 0 }
+  ]
+}
+```
 
 ### `GET /locations/{locationId}/events?limit=20`
 
